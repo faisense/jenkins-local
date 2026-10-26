@@ -382,13 +382,11 @@ def j = jenkins.model.Jenkins.get()
 def have = (j.labelString ?: '').split(/\s+/).findAll { it } as LinkedHashSet
 def want = '$labels'.split(' ') as List
 def added = want.findAll { !have.contains(it) }
-if (added) {
-  have.addAll(added); j.setLabelString(have.join(' ')); j.save()
-  // Labels cache which nodes match them (expressions too); without a reset, one already
-  // asked for keeps saying "doesn't have label".
-  j.labels.each { it.reset() }
-  println(added.join(' '))
-}
+if (added) { have.addAll(added); j.setLabelString(have.join(' ')); j.save(); println(added.join(' ')) }
+// Labels cache which nodes match them (expressions too), and the cache can go stale (e.g.
+// one asked for before its labels existed); then the stage waits forever on a node that
+// has the labels. Recomputing every time is cheap.
+j.labels.each { it.reset() }
 EOF
 }
 
