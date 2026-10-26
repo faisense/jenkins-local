@@ -11,7 +11,9 @@
 #                              X_SSH_KEY=path      sshUserPrivateKey X (+ X_SSH_USER, default
 #                                                  git, and X_SSH_PASSPHRASE)
 #                              anything else       secret text
-#   jenkins-local -e FILE   use another env file instead (--env-file)
+#                            Agent labels the Jenkinsfile asks for (agent { label 'gpu' },
+#                            node('linux')) are added to this machine, the only agent.
+#   jenkins-local -e FILE    use another env file instead (--env-file)
 #   jenkins-local --no-env   no repo secrets; only the global ones apply
 #   jenkins-local --keep-workspace
 #                            keep the build's workspace afterwards (deleted by default)
@@ -357,6 +359,39 @@ snapshot() {
   echo "$commit"
 }
 
+# Agent labels a Jenkinsfile asks for, one per line: declarative `label 'x'` (also inside
+# docker { }), scripted node('x') / node(label: 'x'); expressions such as 'linux && gpu' give
+# each label. `sh label: '...'` is a step's display name, not an agent label, so a `label`
+# followed by a colon is skipped.
+jenkinsfile_labels() {
+  perl -ne '
+    while (/(?:^|[\s{;])label\s+["\x27]([^"\x27]+)["\x27]/g) { print "$1\n" }
+    while (/\bnode\s*\(\s*(?:label\s*:\s*)?["\x27]([^"\x27]+)["\x27]/g) { print "$1\n" }
+  ' "$1" | tr -s '&|!()[:space:]' '\n' | grep -E '^[A-Za-z0-9_.-]+$' | sort -u || true
+}
+
+# Here the only agent is this machine, so it gets every label the Jenkinsfile asks for;
+# otherwise `agent { label 'gpu' }` would wait forever for a node that never comes. Labels
+# are only added (other repos may need theirs) and printed when new.
+ensure_labels() {
+  local labels
+  labels=$(jenkinsfile_labels "$1" | paste -sd' ')
+  [ -n "$labels" ] || return 0
+  cli groovy = <<EOF | sed 's/^/Agent labels added to this machine: /' >&2
+def j = jenkins.model.Jenkins.get()
+def have = (j.labelString ?: '').split(/\s+/).findAll { it } as LinkedHashSet
+def want = '$labels'.split(' ') as List
+def added = want.findAll { !have.contains(it) }
+if (added) {
+  have.addAll(added); j.setLabelString(have.join(' ')); j.save()
+  // Labels cache which nodes match them (expressions too); without a reset, one already
+  // asked for keeps saying "doesn't have label".
+  j.labels.each { it.reset() }
+  println(added.join(' '))
+}
+EOF
+}
+
 # The name a Multibranch project gives a branch job: the branch, URL-encoded (a/b -> a%2Fb).
 branch_job_name() { printf '%s' "$1" | perl -pe 's/([^A-Za-z0-9._~-])/sprintf("%%%02X", ord $1)/ge'; }
 
@@ -405,6 +440,9 @@ status() {
   echo "Data: $home, $(kb_to_human "$(du -sk "$home" 2>/dev/null | cut -f1)") (warning above ${warn_gb}G)"
   usage_breakdown
   echo "Global secrets: $(ls "$secrets" 2>/dev/null | wc -l)"
+  if running; then
+    echo "Agent labels: $(echo 'print(jenkins.model.Jenkins.get().labelString ?: "")' | cli groovy = 2>/dev/null || true)"
+  fi
   echo "Jobs:"
   local cfg repo
   for cfg in "$home"/jobs/*/config.xml; do
@@ -486,7 +524,7 @@ EOF
 
   echo "jenkins-local selftest:"
   check "build passed" '[ "$rc" = 0 ]'
-  for stage in "Docker agent" "Workspace" "SCM checkout" "Secret from .env" "Credential types" \
+  for stage in "Docker agent" "Workspace" "SCM checkout" "Secret from .env" "Agent label" "Credential types" \
       "Artifact and test report"; do
     check "stage: $stage" 'stage_ok "$stage"'
   done
@@ -555,6 +593,7 @@ build() {
       | awk -F'\t' '{ printf "%s%s", sep, $2 ($1 == "string" ? "" : " (" $1 ")"); sep = " " }')" >&2
   fi
   cli get-job "$job" >/dev/null 2>&1 || index_branch "$project" "$job"
+  ensure_labels "$repo/Jenkinsfile"
 
   warn_if_big
   echo "Building $project » $branch (working tree at ${commit:0:8}): http://127.0.0.1:$port/job/$project/job/$(branch_job_name "$branch")/" >&2
