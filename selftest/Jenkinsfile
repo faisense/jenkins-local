@@ -11,10 +11,21 @@ pipeline {
             }
         }
 
-        // jenkins-local commits the copied working tree, so the workspace is a git checkout.
+        // The workspace is a checkout of the working-tree snapshot: untracked files in,
+        // .gitignore'd ones out.
         stage('Workspace') {
             steps {
                 sh 'test -d .git && test -f Jenkinsfile && test -f marker.txt && test ! -e ignored.txt'
+            }
+        }
+
+        // A Multibranch job: BRANCH_NAME is the repo's branch, and `checkout scm` works.
+        // On the built-in node, which has git (alpine doesn't).
+        stage('SCM checkout') {
+            agent any
+            steps {
+                checkout scm
+                sh '[ "$BRANCH_NAME" = "selftest/main" ] && [ -n "$GIT_COMMIT" ] && test -f marker.txt'
             }
         }
 

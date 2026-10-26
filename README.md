@@ -16,12 +16,14 @@ Pipeline plugin, so `agent { docker { image '...' } }` works.
 ## What a build does
 
 1. Starts Jenkins if it isn't running.
-2. Creates or updates a folder named after the repo, with a job `build` inside, from the
-   `Jenkinsfile` on disk.
-3. Copies the files git would commit (tracked + untracked, minus `.gitignore`d ones such as
-   `.venv` and `.env`) into a fresh workspace and commits them there, so the build sees a
-   normal checkout. No commit needed in your repo.
-4. Runs the build, streams the log, deletes the workspace, and exits 0 on success.
+2. Snapshots the working tree as a commit (what git would commit: tracked + untracked,
+   minus `.gitignore`d files such as `.venv` and `.env`) and pushes it to a local snapshot
+   repo, on a branch named like yours. A throwaway index is used: your index, branch and
+   files are untouched. No commit needed in your repo.
+3. Creates or updates a Multibranch project named after the repo, reading that snapshot
+   repo, so the build is a real checkout: `checkout scm`, `BRANCH_NAME` and `GIT_COMMIT`
+   work as on a CI server. Each branch gets its own job (`<repo> » <branch>`).
+4. Runs that branch's job, streams the log, deletes the workspace, and exits 0 on success.
 
 ## Secrets
 
@@ -50,7 +52,8 @@ Bounded on purpose: workspaces are deleted after each build, jobs keep their las
 (a Jenkinsfile's own `buildDiscarder` wins), the container log is capped at 30 MB, and every
 build warns when the data passes `JENKINS_LOCAL_WARN_GB` (default 5). Data lives in
 `~/.local/share/jenkins-local/`; archived artifacts are under
-`jobs/<repo>/jobs/build/builds/<n>/archive/` and go when their build is discarded.
+`jobs/<repo>/branches/<branch>/builds/<n>/archive/` (the branch folder name is shortened
+and suffixed by Jenkins, e.g. `feature-x.1ttbu8`) and go when their build is discarded.
 
 ## Files
 
@@ -58,11 +61,10 @@ build warns when the data passes `JENKINS_LOCAL_WARN_GB` (default 5). Data lives
 |---|---|
 | `bin/jenkins-local` | the command |
 | `config/Dockerfile`, `config/plugins.txt` | the Jenkins image |
-| `config/job.xml` | template of each repo's job |
 | `selftest/Jenkinsfile` | the sample project `selftest` builds |
 | `~/.config/jenkins-local/secrets/` | global secrets (per machine, not in git) |
 | `~/.local/share/jenkins-local/` | `JENKINS_HOME`: jobs, builds, workspaces (per machine) |
 
 Settings: `JENKINS_LOCAL_PORT` (default 8090), `JENKINS_LOCAL_WARN_GB` (default 5).
 
-Needs: bash, git, rsync, perl, curl, and Docker usable without sudo.
+Needs: bash, git, perl, curl, and Docker usable without sudo.
