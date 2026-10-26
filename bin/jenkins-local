@@ -27,12 +27,12 @@
 # A Jenkinsfile uses them with withCredentials([string(credentialsId: 'ID', variable: ...)]).
 # Changes apply to a running Jenkins at once; no restart.
 #
-# No commit needed: each build starts from a fresh copy of the files git would commit
-# (tracked + untracked, minus .gitignore'd ones like .venv and .env), and the Jenkinsfile
-# on disk.
+# No commit needed: each build is a Multibranch build of a snapshot of the working tree (the
+# files git would commit: tracked + untracked, minus .gitignore'd ones like .venv and .env),
+# so `checkout scm`, BRANCH_NAME and GIT_COMMIT work as on a CI server.
 #
 # Files:
-#   <this repo>/config/               Dockerfile, plugins.txt, job.xml (per-repo job template)
+#   <this repo>/config/               Dockerfile, plugins.txt (the Jenkins image)
 #   ~/.config/jenkins-local/secrets/  one file per secret (managed by `secret`), mode 600;
 #                                     outside the repo, so never committed
 #   ~/.local/share/jenkins-local/     JENKINS_HOME: jobs, builds, workspaces
@@ -191,14 +191,43 @@ read_env_file() {
   done < "$1"
 }
 
-# Config of the repo's folder. Folder credentials override global ones with the same ID for
-# the jobs inside, so each repo can have its own values. Without an env file the folder has
-# none, and the global `secret` store applies. Secrets are in plain text here; Jenkins
-# encrypts them on save. Printed to stdout only, for piping straight into the CLI.
-folder_xml() {
-  local env_file=${1:-} key val
-  echo "<com.cloudbees.hudson.plugins.folder.Folder>"
-  echo "  <description>$(xml_escape <<< "${2:-}")</description>"
+# Config of the repo's Multibranch project: branches come from the repo's snapshot remote
+# (see snapshot), so builds get a real checkout, `checkout scm` and BRANCH_NAME as on a CI
+# server. Branch jobs are only built on request (NoTriggerBranchProperty), never on indexing.
+# The project is a folder: its credentials override global ones with the same ID for the
+# branches inside, so each repo can have its own values. Without an env file it has none,
+# and the global `secret` store applies. Secrets are in plain text here; Jenkins encrypts
+# them on save. Printed to stdout only, for piping straight into the CLI.
+project_xml() {
+  local env_file=${1:-} desc=${2:-} remote=${3:-} key val
+  echo "<org.jenkinsci.plugins.workflow.multibranch.WorkflowMultiBranchProject>"
+  echo "  <description>$(xml_escape <<< "$desc")</description>"
+  echo "  <orphanedItemStrategy class=\"com.cloudbees.hudson.plugins.folder.computed.DefaultOrphanedItemStrategy\">"
+  echo "    <pruneDeadBranches>true</pruneDeadBranches><daysToKeep>-1</daysToKeep><numToKeep>-1</numToKeep>"
+  echo "    <abortBuilds>false</abortBuilds>"
+  echo "  </orphanedItemStrategy>"
+  echo "  <sources class=\"jenkins.branch.MultiBranchProject\$BranchSourceList\"><data>"
+  echo "    <jenkins.branch.BranchSource>"
+  echo "      <source class=\"jenkins.plugins.git.GitSCMSource\">"
+  echo "        <id>jenkins-local</id>"
+  echo "        <remote>$(xml_escape <<< "file://$remote")</remote>"
+  echo "        <traits><jenkins.plugins.git.traits.BranchDiscoveryTrait/></traits>"
+  echo "      </source>"
+  echo "      <strategy class=\"jenkins.branch.DefaultBranchPropertyStrategy\">"
+  echo "        <properties class=\"java.util.Arrays\$ArrayList\"><a class=\"jenkins.branch.BranchProperty-array\">"
+  echo "          <jenkins.branch.NoTriggerBranchProperty/>"
+  # Keep the last 20 builds per branch; a Jenkinsfile's own buildDiscarder wins.
+  echo "          <jenkins.branch.BuildRetentionBranchProperty><buildDiscarder class=\"hudson.tasks.LogRotator\">"
+  echo "            <daysToKeep>-1</daysToKeep><numToKeep>20</numToKeep>"
+  echo "            <artifactDaysToKeep>-1</artifactDaysToKeep><artifactNumToKeep>-1</artifactNumToKeep>"
+  echo "          </buildDiscarder></jenkins.branch.BuildRetentionBranchProperty>"
+  echo "        </a></properties>"
+  echo "      </strategy>"
+  echo "    </jenkins.branch.BranchSource>"
+  echo "  </data></sources>"
+  echo "  <factory class=\"org.jenkinsci.plugins.workflow.multibranch.WorkflowBranchProjectFactory\">"
+  echo "    <scriptPath>Jenkinsfile</scriptPath>"
+  echo "  </factory>"
   echo "  <properties>"
   if [ -n "$env_file" ]; then
     echo "    <com.cloudbees.hudson.plugins.folder.properties.FolderCredentialsProvider_-FolderCredentialsProperty>"
@@ -217,7 +246,47 @@ folder_xml() {
     echo "    </com.cloudbees.hudson.plugins.folder.properties.FolderCredentialsProvider_-FolderCredentialsProperty>"
   fi
   echo "  </properties>"
-  echo "</com.cloudbees.hudson.plugins.folder.Folder>"
+  echo "</org.jenkinsci.plugins.workflow.multibranch.WorkflowMultiBranchProject>"
+}
+
+# Commit the working tree as it is now (what git would commit: tracked + untracked, minus
+# .gitignore'd files) and force-push it to the repo's snapshot remote, on a branch of the
+# same name. A throwaway index is used, so the repo's index, branch and files are untouched;
+# only a commit object is added to its .git. Prints the snapshot commit.
+snapshot() {
+  local repo=$1 remote=$2 branch=$3 index tree commit parent=()
+  [ -d "$remote" ] || git init -q --bare "$remote"
+  index=$(mktemp "$home/.index.XXXXXX")
+  # Start from HEAD so files tracked despite .gitignore stay in, as in a commit.
+  if git -C "$repo" rev-parse -q --verify HEAD >/dev/null; then
+    GIT_INDEX_FILE=$index git -C "$repo" read-tree HEAD
+    parent=(-p HEAD)
+  else
+    rm -f "$index"
+  fi
+  GIT_INDEX_FILE=$index git -C "$repo" add -A
+  tree=$(GIT_INDEX_FILE=$index git -C "$repo" write-tree)
+  rm -f "$index"
+  commit=$(GIT_AUTHOR_NAME=jenkins-local GIT_AUTHOR_EMAIL=jenkins-local@localhost \
+    GIT_COMMITTER_NAME=jenkins-local GIT_COMMITTER_EMAIL=jenkins-local@localhost \
+    git -C "$repo" commit-tree "$tree" "${parent[@]}" -m "Working tree of $repo")
+  # --no-verify: the repo's own pre-push hooks are for real remotes, not this one.
+  git -C "$repo" push -q --no-verify --force "$remote" "$commit:refs/heads/$branch"
+  echo "$commit"
+}
+
+# The name a Multibranch project gives a branch job: the branch, URL-encoded (a/b -> a%2Fb).
+branch_job_name() { printf '%s' "$1" | perl -pe 's/([^A-Za-z0-9._~-])/sprintf("%%%02X", ord $1)/ge'; }
+
+# Run branch indexing so a new branch gets its job, and wait for that job (up to 60 s).
+index_branch() {
+  local project=$1 job=$2 i
+  echo "jenkins.model.Jenkins.get().getItemByFullName('$project').scheduleBuild2(0)" | cli groovy = >/dev/null
+  for i in $(seq 60); do
+    cli get-job "$job" >/dev/null 2>&1 && return 0
+    sleep 1
+  done
+  die "branch indexing did not create $job; see http://127.0.0.1:$port/job/$project/indexing/"
 }
 
 kb_to_human() { awk -v k="$1" 'BEGIN { split("K M G T", u); i = 1; while (k >= 1024 && i < 4) { k /= 1024; i++ } printf "%.1f%s", k, u[i] }'; }
@@ -225,7 +294,7 @@ kb_to_human() { awk -v k="$1" 'BEGIN { split("K M G T", u); i = 1; while (k >= 1
 # The biggest things in JENKINS_HOME, largest first.
 usage_breakdown() {
   # du fails on a pattern that matches nothing (no jobs yet); what it did measure still counts.
-  (cd "$home" && du -sk workspace/*/* jobs/*/jobs/*/builds jobs/*/builds plugins war 2>/dev/null || true) \
+  (cd "$home" && du -sk workspace/* jobs/*/branches/*/builds sources/* plugins war 2>/dev/null || true) \
     | sort -rn | awk -v n="${1:-8}" 'NR <= n' | while read -r kb path; do
       printf '  %8s  %s\n' "$(kb_to_human "$kb")" "$path"
     done
@@ -290,8 +359,7 @@ selftest() {
   # Not `name`: that is the container's, and bash locals are visible to called functions.
   local sample=jenkins-local-selftest
   local src=$home/selftest/$sample log=$home/selftest/build.log
-  local build_dir=$home/jobs/$sample/jobs/build/builds
-  local failures=0 rc=0 n
+  local build_dir failures=0 rc=0 n
 
   check() { if eval "$2"; then echo "  ok    $1"; else echo "  FAIL  $1"; failures=$((failures + 1)); fi; }
   # Jenkins prints a step's error at the end of the log, not in its stage; but every stage
@@ -315,24 +383,26 @@ selftest() {
   echo "must not be copied" > "$src/ignored.txt"
   printf 'ignored.txt\n.env\n' > "$src/.gitignore"
   echo "SELFTEST_TOKEN=from-dotenv" > "$src/.env"
-  git -C "$src" init -q
+  # On a branch with a slash, to check the branch job's name and BRANCH_NAME.
+  git -C "$src" init -q -b selftest/main
 
   echo "Building the sample project (first run pulls alpine:3.20)..." >&2
   (cd "$src" && build) > "$log" 2>&1 || rc=$?
+  build_dir=$(ls -d "$home/jobs/$sample/branches/"*/builds 2>/dev/null | head -1 || true)
   n=$(ls "$build_dir" 2>/dev/null | grep -E '^[0-9]+$' | sort -n | tail -1 || true)
 
   echo "jenkins-local selftest:"
   check "build passed" '[ "$rc" = 0 ]'
-  for stage in "Docker agent" "Workspace" "Secret from .env" "Artifact and test report"; do
+  for stage in "Docker agent" "Workspace" "SCM checkout" "Secret from .env" "Artifact and test report"; do
     check "stage: $stage" 'stage_ok "$stage"'
   done
   check "artifact archived" '[ "$(cat "$build_dir/$n/archive/artifact.txt" 2>/dev/null)" = selftest-ok ]'
   check "test report recorded" '[ -f "$build_dir/$n/junitResult.xml" ]'
-  check "workspace deleted after the build" '[ ! -e "$home/workspace/$sample/build" ]'
+  check "workspace deleted after the build" '! ls -d "$home/workspace/${sample}_"* >/dev/null 2>&1'
 
   if [ "$failures" = 0 ]; then
     cli delete-job "$sample" >/dev/null 2>&1 || true
-    rm -rf "$home/selftest" "$home/workspace/$sample"
+    rm -rf "$home/selftest" "$home/sources/$sample.git"
     echo "All good."
   else
     echo "$failures check(s) failed. Build log: $log (job kept: http://127.0.0.1:$port/job/$sample/)"
@@ -351,7 +421,7 @@ build() {
     esac
   done
 
-  local repo folder job ws script
+  local repo project job remote branch commit ws
   repo=$(git rev-parse --show-toplevel 2>/dev/null) || die "not in a git repo"
   [ -f "$repo/Jenkinsfile" ] || die "no Jenkinsfile in $repo"
 
@@ -365,59 +435,47 @@ build() {
   fi
   start
 
-  # One folder per repo (holding its env-file secrets), with the job inside.
-  folder=$(basename "$repo" | tr -c 'A-Za-z0-9._\n-' '-')
-  job=$folder/build
-  # Before folders, the job itself was named after the repo; that one is replaced.
-  if cli get-job "$folder" 2>/dev/null | grep -q '<flow-definition'; then
-    cli delete-job "$folder"
+  # One Multibranch project per repo (holding its env-file secrets), one job per branch.
+  project=$(basename "$repo" | tr -c 'A-Za-z0-9._\n-' '-')
+  remote=$home/sources/$project.git
+  branch=$(git -C "$repo" branch --show-current); branch=${branch:-detached}
+  job=$project/$(branch_job_name "$branch")
+
+  commit=$(snapshot "$repo" "$remote" "$branch")
+
+  # Older jenkins-local versions made a plain folder (or job) here; that one is replaced.
+  if cli get-job "$project" 2>/dev/null | grep -qE '<(com\.cloudbees\.hudson\.plugins\.folder\.Folder|flow-definition)[ >]'; then
+    cli delete-job "$project"
   fi
-  if cli get-job "$folder" >/dev/null 2>&1; then
-    folder_xml "$env_file" "Local builds of $repo (managed by jenkins-local)" | cli update-job "$folder"
+  if cli get-job "$project" >/dev/null 2>&1; then
+    project_xml "$env_file" "Local builds of $repo (managed by jenkins-local)" "$remote" | cli update-job "$project"
   else
-    folder_xml "$env_file" "Local builds of $repo (managed by jenkins-local)" | cli create-job "$folder"
+    project_xml "$env_file" "Local builds of $repo (managed by jenkins-local)" "$remote" | cli create-job "$project"
   fi
   if [ -n "$env_file" ]; then
     echo "Secrets from $env_file: $(read_env_file "$env_file" | cut -f1 | paste -sd' ')" >&2
   fi
-
-  # The Jenkinsfile goes into the job inline, so the build needs no checkout.
-  script=$(xml_escape < "$repo/Jenkinsfile")
-  REPO=$repo SCRIPT=$script perl -pe 's/__REPO__/$ENV{REPO}/g; s/__SCRIPT__/$ENV{SCRIPT}/g' \
-    "$conf/job.xml" > "$home/.job-$folder.xml"
-  if cli get-job "$job" >/dev/null 2>&1; then
-    cli update-job "$job" < "$home/.job-$folder.xml"
-  else
-    cli create-job "$job" < "$home/.job-$folder.xml"
-  fi
-  rm -f "$home/.job-$folder.xml"
-
-  # A fresh workspace every build, as a CI checkout would be.
-  ws=$home/workspace/$job
-  rm -rf "$ws" && mkdir -p "$ws"
-  (cd "$repo" && git ls-files -z --cached --others --exclude-standard \
-    | rsync -a --from0 --files-from=- --ignore-missing-args ./ "$ws/")
-  # A checkout is a git repo, and tools like pre-commit need one: commit the copy, on a
-  # branch of the same name.
-  local branch
-  branch=$(git -C "$repo" branch --show-current); branch=${branch:-local}
-  git -C "$ws" init -q -b "$branch"
-  git -C "$ws" add -A
-  git -C "$ws" -c user.name=jenkins-local -c user.email=jenkins-local@localhost \
-    commit -q --no-verify -m "Working tree of $repo"
+  cli get-job "$job" >/dev/null 2>&1 || index_branch "$project" "$job"
 
   warn_if_big
-  echo "Building $job (working tree of $repo): http://127.0.0.1:$port/job/$folder/job/build/" >&2
-  # -f waits for the result and sets the exit code; -v streams the console log.
-  local rc=0
-  cli build "$job" -f -v || rc=$?
+  echo "Building $project » $branch (working tree at ${commit:0:8}): http://127.0.0.1:$port/job/$project/job/$(branch_job_name "$branch")/" >&2
+  # -f waits for the result and sets the exit code; -v streams the console log, which is also
+  # kept to find the workspace afterwards (Multibranch names it, e.g. repo_branch).
+  local rc=0 log
+  log=$(mktemp "$home/.build-log.XXXXXX")
+  cli build "$job" -f -v | tee "$log" || rc=$?
+  ws=$(sed -n 's/^Running on .* in \(\/.*\)$/\1/p; T; q' "$log")
+  rm -f "$log"
 
   # The workspace (a venv, caches: hundreds of MB) is rebuilt next time anyway. On Ctrl-C the
   # script stops before this while the build may still run, so it is left for `prune`.
-  if [ "$keep_ws" = 1 ]; then
+  if [ -z "$ws" ]; then
+    :
+  elif [ "$keep_ws" = 1 ]; then
     echo "Workspace kept: $ws" >&2
   else
-    rm -rf "$ws" "$ws@tmp" "$ws@script" "$ws@libs"
+    # Also its siblings: @tmp, @script, @libs, and @2... for stages with their own agent.
+    case "$ws" in "$home"/workspace/?*) rm -rf "$ws" "$ws"@* ;; esac
   fi
   return "$rc"
 }

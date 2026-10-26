@@ -8,7 +8,7 @@ bin=$HOME/.local/bin
 secrets=${XDG_CONFIG_HOME:-$HOME/.config}/jenkins-local/secrets
 
 missing=()
-for cmd in bash git rsync perl curl realpath docker; do
+for cmd in bash git perl curl realpath docker; do
   command -v "$cmd" >/dev/null || missing+=("$cmd")
 done
 [ ${#missing[@]} -eq 0 ] || { echo "Install first: ${missing[*]}" >&2; exit 1; }
