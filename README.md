@@ -58,6 +58,7 @@ Pipeline plugin, so `agent { docker { image '...' } }` works.
 | `jenkins-local secret set\|list\|rm` | global secrets |
 | `jenkins-local lib add NAME PATH` / `lib list` / `lib rm NAME` | shared libraries (below) |
 | `jenkins-local tool add maven\|jdk NAME VERSION` / `tool list` / `tool rm maven\|jdk NAME` | build tools (below) |
+| `jenkins-local plugins sync URL` / `plugins unsync` / `plugins list` | match a server's Jenkins and plugin versions (below) |
 
 ## Shared libraries
 
@@ -83,6 +84,21 @@ clears them). Only Maven and JDK are supported.
 `tools { }` applies only to stages that don't run in a docker agent, as on any Jenkins:
 Jenkins can't set `PATH` inside a container (and a downloaded JDK needs glibc).
 
+## Plugins
+
+The image installs `config/plugins.txt` (what jenkins-local needs: configuration-as-code,
+Pipeline, Docker Pipeline, git, credentials, JUnit, Temurin installer) on Jenkins LTS.
+
+- **Match your CI server:** `jenkins-local plugins sync https://ci.example.com` records the
+  server's Jenkins version and its active plugins' exact versions; `jenkins-local restart`
+  then builds the image from that Jenkins version with those plugins pinned (plus the ones
+  above). Set `JENKINS_LOCAL_SERVER_AUTH=user:api-token` if the server needs a login.
+  `plugins unsync` goes back to LTS. A restart whose image fails to build keeps the running
+  Jenkins.
+- **Per project:** a `jenkins-plugins.txt` in the repo (same format: `name` or
+  `name:version`, `#` comments) lists plugins its Jenkinsfile needs; the missing ones are
+  installed before its build (Jenkins restarts only if one of them requires it) and stay
+  installed.
 ## Disk use
 
 Bounded on purpose: workspaces are deleted after each build, jobs keep their last 20 builds
