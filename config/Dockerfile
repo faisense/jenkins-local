@@ -1,5 +1,7 @@
 # Local Jenkins for trying Jenkinsfiles of any project. Built and run by bin/jenkins-local.
-FROM jenkins/jenkins:lts
+# The Jenkins version: lts, or the target server's after `jenkins-local plugins sync`.
+ARG JENKINS_VERSION=lts
+FROM jenkins/jenkins:${JENKINS_VERSION}
 
 # `agent { docker { ... } }` shells out to the docker CLI; the daemon is the host's,
 # through the mounted socket.

@@ -54,6 +54,14 @@
 # enough (maven '3.9.9', jdk 'jdk21'); otherwise the build prints the command to run.
 # tools { } only applies outside docker agents, as on any Jenkins.
 #
+#   jenkins-local plugins sync URL    match a target server: its Jenkins version and its plugins'
+#                                     versions are used from the next restart on
+#                                     (JENKINS_LOCAL_SERVER_AUTH=user:token if it needs a login)
+#   jenkins-local plugins unsync      back to Jenkins LTS and config/plugins.txt
+#   jenkins-local plugins list        installed plugins
+# A repo's jenkins-plugins.txt (plugins.txt format) lists plugins its Jenkinsfile needs; the
+# missing ones are installed before its build.
+#
 # No commit needed: each build is a Multibranch build of a snapshot of the working tree (the
 # files git would commit: tracked + untracked, minus .gitignore'd ones like .venv and .env),
 # so `checkout scm`, BRANCH_NAME and GIT_COMMIT work as on a CI server.
@@ -82,6 +90,9 @@ warn_gb=${JENKINS_LOCAL_WARN_GB:-5}
 secrets=${XDG_CONFIG_HOME:-$HOME/.config}/jenkins-local/secrets
 # Shared libraries registered with `lib add`: "name<TAB>path" lines.
 libraries=${XDG_CONFIG_HOME:-$HOME/.config}/jenkins-local/libraries
+# Set by `plugins sync`: a target server's Jenkins version and its plugins (name:version).
+pinned_version=${XDG_CONFIG_HOME:-$HOME/.config}/jenkins-local/jenkins-version
+pinned_plugins=${XDG_CONFIG_HOME:-$HOME/.config}/jenkins-local/plugins.pinned
 name=jenkins-local
 image=jenkins-local
 
@@ -199,6 +210,71 @@ EOF
       ;;
     *) die "usage: jenkins-local lib add NAME PATH | lib list | lib rm NAME" ;;
   esac
+}
+
+# Match a target Jenkins server: record its version and its active plugins' versions, used
+# by the next start (jenkins-local restart). JENKINS_LOCAL_SERVER_AUTH=user:token if the
+# server needs a login.
+plugins() {
+  case "${1:-}" in
+    sync)
+      local url=${2:-} json version tmp
+      [ -n "$url" ] || die "usage: jenkins-local plugins sync URL (JENKINS_LOCAL_SERVER_AUTH=user:token if needed)"
+      url=${url%/}
+      tmp=$(mktemp -d "${TMPDIR:-/tmp}/jenkins-local.XXXXXX")
+      curl -sfg ${JENKINS_LOCAL_SERVER_AUTH:+-u "$JENKINS_LOCAL_SERVER_AUTH"} -D "$tmp/headers" -o "$tmp/plugins.json" \
+        "$url/pluginManager/api/json?depth=1&tree=plugins[shortName,version,active]" \
+        || { rm -rf "$tmp"; die "could not read $url/pluginManager (a login? set JENKINS_LOCAL_SERVER_AUTH=user:token)"; }
+      version=$(tr -d '\r' < "$tmp/headers" | awk -F': ' 'tolower($1) == "x-jenkins" { print $2 }')
+      [ -n "$version" ] || { rm -rf "$tmp"; die "$url does not look like Jenkins (no X-Jenkins header)"; }
+      mkdir -p "$(dirname "$pinned_plugins")"
+      perl -MJSON::PP -e '
+        local $/; my $d = decode_json(<STDIN>);
+        print "$_->{shortName}:$_->{version}\n" for sort { $a->{shortName} cmp $b->{shortName} }
+          grep { $_->{active} } @{ $d->{plugins} };
+      ' < "$tmp/plugins.json" > "$pinned_plugins"
+      echo "$version" > "$pinned_version"
+      rm -rf "$tmp"
+      echo "Synced from $url: Jenkins $version, $(wc -l < "$pinned_plugins" | tr -d ' ') plugins pinned." >&2
+      echo "Apply with: jenkins-local restart" >&2
+      ;;
+    unsync)
+      rm -f "$pinned_plugins" "$pinned_version"
+      echo "Back to Jenkins LTS and config/plugins.txt. Apply with: jenkins-local restart" >&2
+      ;;
+    list)
+      running || die "Jenkins is not running (jenkins-local start)"
+      cli list-plugins | awk '{ print $1, $NF }' | sort
+      ;;
+    *) die "usage: jenkins-local plugins sync URL | plugins unsync | plugins list" ;;
+  esac
+}
+
+# Plugins a repo asks for in jenkins-plugins.txt (plugins.txt format: name or name:version,
+# # comments) that this Jenkins lacks are installed before the build; Jenkins restarts only
+# if one of them requires it. They stay installed.
+ensure_repo_plugins() {
+  local file=$1/jenkins-plugins.txt entries missing
+  [ -f "$file" ] || return 0
+  entries=$(sed -e 's/#.*//' -e 's/[[:space:]]//g' -e '/^$/d' "$file")
+  # The entries (name or name:version) whose plugin isn't installed.
+  missing=$(awk -F: 'NR == FNR { have[$1] = 1; next } !have[$1]' \
+    <(cli list-plugins | awk '{ print $1 }') <(printf '%s\n' "$entries"))
+  [ -n "$missing" ] || return 0
+  echo "Installing plugins from $file: $(paste -sd' ' <<< "$missing")" >&2
+  # -deploy loads them at once when they allow it.
+  # shellcheck disable=SC2046
+  cli install-plugin $(printf '%s\n' "$missing") -deploy >&2
+  if [ "$(echo 'println(jenkins.model.Jenkins.get().updateCenter.isRestartRequiredForCompletion())' | cli groovy =)" = true ]; then
+    echo "Restarting Jenkins to finish installing them..." >&2
+    cli safe-restart >/dev/null 2>&1 || true
+    local i
+    for i in $(seq 180); do
+      sleep 1
+      curl -sf -o /dev/null "http://127.0.0.1:$port/login" && break
+    done
+    curl -sf -o /dev/null "http://127.0.0.1:$port/login" || die "Jenkins did not come back after installing plugins"
+  fi
 }
 
 # Tools (tools { maven '...' jdk '...' } / tool '...'): auto-installing tool definitions in
@@ -367,18 +443,44 @@ EOF
   fi
 }
 
+# The plugins the image installs: config/plugins.txt (what jenkins-local itself needs), with
+# a synced server's plugins pinned on top (a pinned version wins for the same plugin).
+image_plugins() {
+  {
+    [ -f "$pinned_plugins" ] && cat "$pinned_plugins"
+    sed -e 's/#.*//' -e '/^[[:space:]]*$/d' "$conf/plugins.txt"
+  } | awk -F: '!seen[$1]++'
+}
+
+# --force (restart): rebuild and replace a running Jenkins; it keeps running if the build fails.
 start() {
-  running && return 0
+  [ "${1:-}" = --force ] || ! running || return 0
   [ -f "$conf/Dockerfile" ] || die "missing $conf/Dockerfile"
   mkdir -p "$home" "$secrets" && chmod 700 "$secrets"
   write_casc
 
-  echo "Building the image..." >&2
-  docker build -q -t "$image" "$conf" >/dev/null
+  local version=lts ctx image_hash
+  [ -f "$pinned_version" ] && version=$(cat "$pinned_version")
+  ctx=$(mktemp -d "$home/.image.XXXXXX")
+  cp "$conf/Dockerfile" "$ctx/"
+  image_plugins > "$ctx/plugins.txt"
+  echo "Building the image (Jenkins $version, $(wc -l < "$ctx/plugins.txt" | tr -d ' ') plugins)..." >&2
+  if ! docker build -q --build-arg "JENKINS_VERSION=$version" -t "$image" "$ctx" >/dev/null; then
+    rm -rf "$ctx"
+    die "image build failed (Jenkins $version); see the output above"
+  fi
+  # Jenkins only copies the image's plugins into JENKINS_HOME when they are missing there,
+  # so a changed plugin set (a sync, an unsync) starts from a clean plugins directory.
+  image_hash=$( (echo "$version"; cat "$ctx/plugins.txt") | git hash-object --stdin)
+  rm -rf "$ctx"
   docker rm -f "$name" >/dev/null 2>&1 || true
+  if [ "$(cat "$home/.image.hash" 2>/dev/null)" != "$image_hash" ]; then
+    rm -rf "${home:?}/plugins"
+  fi
+  echo "$image_hash" > "$home/.image.hash"
 
   # JENKINS_HOME at the same absolute path inside and out: a docker agent asks the host's
-  # daemon to mount the workspace, and this script fills workspaces from the host.
+  # daemon to mount the workspace, and the workspaces live under JENKINS_HOME.
   # Runs as you, so workspace files are yours and the docker socket's group applies.
   # The container log is capped (Docker keeps it forever otherwise).
   docker run -d --name "$name" --restart unless-stopped \
@@ -838,6 +940,7 @@ build() {
     env_file=$repo/.env
   fi
   start
+  ensure_repo_plugins "$repo"
 
   # One Multibranch project per repo (holding its env-file secrets), one job per branch.
   project=$(basename "$repo" | tr -c 'A-Za-z0-9._\n-' '-')
@@ -909,12 +1012,13 @@ case "${1:-build}" in
   status) status ;;
   prune) prune ;;
   selftest) shift; selftest "$@" ;;
-  restart) docker rm -f "$name" >/dev/null 2>&1 || true; start ;;
+  restart) start --force ;;
   stop) docker rm -f "$name" >/dev/null 2>&1 || true; echo "stopped (data kept in $home)" ;;
   logs) docker logs -f "$name" ;;
   secret) shift; secret "$@" ;;
   lib) shift; lib "$@" ;;
   tool) shift; tool "$@" ;;
+  plugins) shift; plugins "$@" ;;
   -h|--help|help) sed -n '2,/^set -euo/p' "$0" | sed '$d; s/^# \{0,1\}//' ;;
   *) die "unknown command '$1' (see: jenkins-local help)" ;;
 esac
