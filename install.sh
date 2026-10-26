@@ -3,12 +3,13 @@
 # everything it needs is here. Safe to run again (e.g. after moving the repo).
 set -euo pipefail
 
-repo=$(cd "$(dirname "$(realpath "$0")")" && pwd)
+# realpath is missing before macOS 13; perl's abs_path also resolves symlinks.
+repo=$(cd "$(dirname "$(perl -MCwd -e 'print Cwd::abs_path(shift)' "$0")")" && pwd)
 bin=$HOME/.local/bin
 secrets=${XDG_CONFIG_HOME:-$HOME/.config}/jenkins-local/secrets
 
 missing=()
-for cmd in bash git perl curl realpath docker; do
+for cmd in bash git perl curl docker; do
   command -v "$cmd" >/dev/null || missing+=("$cmd")
 done
 [ ${#missing[@]} -eq 0 ] || { echo "Install first: ${missing[*]}" >&2; exit 1; }
