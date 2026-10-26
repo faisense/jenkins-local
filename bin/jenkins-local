@@ -393,15 +393,38 @@ EOF
 # The name a Multibranch project gives a branch job: the branch, URL-encoded (a/b -> a%2Fb).
 branch_job_name() { printf '%s' "$1" | perl -pe 's/([^A-Za-z0-9._~-])/sprintf("%%%02X", ord $1)/ge'; }
 
-# Run branch indexing so a new branch gets its job, and wait for that job (up to 60 s).
+# Run branch indexing so a new branch gets its job, and wait for it to finish.
 index_branch() {
-  local project=$1 job=$2 i
+  local project=$1 job=$2 since
+  since=$(indexing_stamp "$project")
   echo "jenkins.model.Jenkins.get().getItemByFullName('$project').scheduleBuild2(0)" | cli groovy = >/dev/null
-  for i in $(seq 60); do
-    cli get-job "$job" >/dev/null 2>&1 && return 0
-    sleep 1
-  done
-  die "branch indexing did not create $job; see http://127.0.0.1:$port/job/$project/indexing/"
+  wait_indexing "$project" "$since"
+  cli get-job "$job" >/dev/null 2>&1 \
+    || die "branch indexing did not create $job; see http://127.0.0.1:$port/job/$project/indexing/"
+}
+
+# Start time (ms) of the project's latest branch indexing; 0 if none.
+indexing_stamp() {
+  echo "println(jenkins.model.Jenkins.get().getItemByFullName('$1')?.computation?.timestamp?.timeInMillis ?: 0)" \
+    | cli groovy =
+}
+
+# Wait for an indexing newer than $2 (an indexing_stamp) to finish. Creating or updating a
+# Multibranch project starts one by itself; a build started while it runs can have its
+# record replaced when the branch job is updated, and then any stage that asks for a node
+# ("Stopping part of ...") waits until it times out. Gives up quietly after 120 s.
+wait_indexing() {
+  cli groovy = <<EOF >/dev/null
+def p = jenkins.model.Jenkins.get().getItemByFullName('$1')
+def t0 = System.currentTimeMillis()
+def newer = { (p?.computation?.timestamp?.timeInMillis ?: 0) > $2L }
+while (System.currentTimeMillis() - t0 < 120000) {
+  if (newer() && !p.computation.isBuilding()) break
+  // Never started (nothing to index): don't wait the full time.
+  if (!newer() && System.currentTimeMillis() - t0 > 15000) break
+  Thread.sleep(250)
+}
+EOF
 }
 
 kb_to_human() { awk -v k="$1" 'BEGIN { split("K M G T", u); i = 1; while (k >= 1024 && i < 4) { k /= 1024; i++ } printf "%.1f%s", k, u[i] }'; }
@@ -528,11 +551,13 @@ EOF
   done
   check "artifact archived" '[ "$(cat "$build_dir/$n/archive/artifact.txt" 2>/dev/null)" = selftest-ok ]'
   check "test report recorded" '[ -f "$build_dir/$n/junitResult.xml" ]'
+  check "built the snapshot just made" \
+    '[ -n "$(git -C "$home/sources/$sample.git" rev-parse -q --verify refs/heads/selftest/main)" ] && grep -qx "selftest-commit=$(git -C "$home/sources/$sample.git" rev-parse refs/heads/selftest/main)" "$log"'
   check "workspace deleted after the build" '! ls -d "$home/workspace/${sample}_"* >/dev/null 2>&1'
 
   if [ "$failures" = 0 ]; then
     cli delete-job "$sample" >/dev/null 2>&1 || true
-    rm -rf "$home/selftest" "$home/sources/$sample.git"
+    rm -rf "$home/selftest" "$home/sources/$sample.git" "$home/.project-$sample.hash"
     echo "All good."
   else
     echo "$failures check(s) failed. Build log: $log (job kept: http://127.0.0.1:$port/job/$sample/)"
@@ -581,11 +606,21 @@ build() {
   if cli get-job "$project" 2>/dev/null | grep -qE '<(com\.cloudbees\.hudson\.plugins\.folder\.Folder|flow-definition)[ >]'; then
     cli delete-job "$project"
   fi
-  if cli get-job "$project" >/dev/null 2>&1; then
-    project_xml "$env_file" "Local builds of $repo (managed by jenkins-local)" "$remote" | cli update-job "$project"
-  else
-    project_xml "$env_file" "Local builds of $repo (managed by jenkins-local)" "$remote" | cli create-job "$project"
+  # Sending the config starts a branch indexing, so it is only sent when it changed (e.g. a
+  # new .env value), and then the build waits for that indexing. Only a hash is kept: the
+  # config holds the secrets.
+  local config hash hash_file=$home/.project-$project.hash since
+  config=$(project_xml "$env_file" "Local builds of $repo (managed by jenkins-local)" "$remote")
+  hash=$(printf '%s' "$config" | git hash-object --stdin)
+  if ! cli get-job "$project" >/dev/null 2>&1; then
+    printf '%s\n' "$config" | cli create-job "$project"
+    wait_indexing "$project" 0
+  elif [ "$(cat "$hash_file" 2>/dev/null)" != "$hash" ]; then
+    since=$(indexing_stamp "$project")
+    printf '%s\n' "$config" | cli update-job "$project"
+    wait_indexing "$project" "$since"
   fi
+  echo "$hash" > "$hash_file"
   if [ -n "$env_file" ]; then
     echo "Secrets from $env_file: $(env_credentials "$env_file" \
       | awk -F'\t' '{ printf "%s%s", sep, $2 ($1 == "string" ? "" : " (" $1 ")"); sep = " " }')" >&2
