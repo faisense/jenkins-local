@@ -38,6 +38,24 @@ pipeline {
             }
         }
 
+        // From .env naming: _USR/_PSW -> usernamePassword, _FILE -> file,
+        // _SSH_KEY (+ _SSH_USER) -> sshUserPrivateKey.
+        stage('Credential types') {
+            steps {
+                withCredentials([
+                    usernamePassword(credentialsId: 'SELFTEST_LOGIN', usernameVariable: 'U', passwordVariable: 'P'),
+                    file(credentialsId: 'SELFTEST_CERT', variable: 'CERT'),
+                    sshUserPrivateKey(credentialsId: 'SELFTEST_DEPLOY', keyFileVariable: 'KEY', usernameVariable: 'KU')
+                ]) {
+                    sh '''
+                        [ "$U" = "robot" ] && [ "$P" = "pa ss#word" ]
+                        [ "$(cat "$CERT")" = "certificate-content" ]
+                        grep -q "BEGIN OPENSSH PRIVATE KEY" "$KEY" && [ "$KU" = "deployer" ]
+                    '''
+                }
+            }
+        }
+
         stage('Artifact and test report') {
             steps {
                 sh '''

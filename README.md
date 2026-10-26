@@ -31,6 +31,14 @@ Pipeline plugin, so `agent { docker { image '...' } }` works.
 
 - **The repo's `.env`** (default): each `KEY=value` line becomes a secret for that repo only,
   overriding a global one with the same ID. `-e FILE` uses another file; `--no-env` none.
+  Key names choose the credential type (paths are relative to the env file):
+
+  | In `.env` | Credential | Use it with |
+  |---|---|---|
+  | `X_USR=...` + `X_PSW=...` | usernamePassword `X` | `usernamePassword(credentialsId: 'X', ...)`, or `credentials('X')`, which sets `X_USR`/`X_PSW` |
+  | `X_FILE=path` | file `X` | `file(credentialsId: 'X', variable: ...)` |
+  | `X_SSH_KEY=path` (+ `X_SSH_USER`, default `git`; `X_SSH_PASSPHRASE`) | sshUserPrivateKey `X` | `sshUserPrivateKey(credentialsId: 'X', ...)`, `sshagent` |
+  | anything else | secret text, ID = the key | `string(credentialsId: 'KEY', variable: ...)` |
 - **Global**: `jenkins-local secret set ID` (asks for the value, or reads stdin),
   `secret list`, `secret rm ID`. Stored one file per secret in
   `~/.config/jenkins-local/secrets/` (mode 600), outside this repo.
