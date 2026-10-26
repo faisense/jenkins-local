@@ -52,11 +52,12 @@ Pipeline plugin, so `agent { docker { image '...' } }` works.
 |---|---|
 | `jenkins-local` | build the current repo (`-e FILE`, `--no-env`, `--keep-workspace`) |
 | `jenkins-local status` | running or not, disk use, secrets, jobs (flags jobs whose repo is gone) |
-| `jenkins-local prune` | delete leftover workspaces |
-| `jenkins-local selftest` | build `selftest/Jenkinsfile` as a throwaway repo and check each feature (docker agent, workspace, `.env` secret, artifacts, test report, cleanup); leaves nothing behind when all pass |
+| `jenkins-local prune` | delete leftover workspaces and downloaded tools |
+| `jenkins-local selftest [--tools]` | build `selftest/Jenkinsfile` as a throwaway repo and check each feature (docker agent, checkout, secrets, labels, shared library, artifacts, test report, cleanup); `--tools` also installs and runs a JDK and Maven (~200 MB, once); leaves nothing behind when all pass |
 | `jenkins-local start` / `stop` / `restart` / `logs` | the Jenkins container; `restart` after editing `config/` |
 | `jenkins-local secret set\|list\|rm` | global secrets |
 | `jenkins-local lib add NAME PATH` / `lib list` / `lib rm NAME` | shared libraries (below) |
+| `jenkins-local tool add maven\|jdk NAME VERSION` / `tool list` / `tool rm maven\|jdk NAME` | build tools (below) |
 
 ## Shared libraries
 
@@ -67,6 +68,20 @@ tree, uncommitted changes included, whatever version it asks for: each build sna
 like the repo itself and defines it as a global library. A library the Jenkinsfile loads but
 that isn't registered is reported before the build (which then fails on it).
 `library(identifier: ..., retriever: ...)` brings its own source and is left alone.
+
+## Build tools
+
+`tools { maven '...'; jdk '...' }` and `tool name: '...', type: 'maven'` need tool
+definitions. A tool the Jenkinsfile names but Jenkins lacks is defined from its name when
+that says enough: a Maven name with a version (`'3.9.9'`, `'maven-3.9.9'`) installs that
+version from Apache, a JDK name with a major (`'jdk21'`, `'temurin-17'`) the latest Eclipse
+Temurin release of it. Otherwise the build says what to run, e.g.
+`jenkins-local tool add maven M3 3.9.9` or `jenkins-local tool add jdk java jdk-21.0.5+11`.
+Tools are downloaded on first use into `~/.local/share/jenkins-local/tools/` (`prune`
+clears them). Only Maven and JDK are supported.
+
+`tools { }` applies only to stages that don't run in a docker agent, as on any Jenkins:
+Jenkins can't set `PATH` inside a container (and a downloaded JDK needs glibc).
 
 ## Disk use
 
