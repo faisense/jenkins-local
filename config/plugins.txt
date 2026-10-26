@@ -6,3 +6,4 @@ credentials-binding
 plain-credentials
 junit
 pipeline-stage-view
+adoptopenjdk

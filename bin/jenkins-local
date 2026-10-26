@@ -18,9 +18,12 @@
 #   jenkins-local --keep-workspace
 #                            keep the build's workspace afterwards (deleted by default)
 #   jenkins-local status     running or not, disk use, global secrets, jobs (and stale ones)
-#   jenkins-local prune      delete leftover workspaces (refuses while a build runs)
-#   jenkins-local selftest   build a small sample project and check each feature: docker
-#                            agent, workspace, .env secret, artifacts, test report, cleanup
+#   jenkins-local prune      delete leftover workspaces and downloaded tools (refuses while a
+#                            build runs)
+#   jenkins-local selftest [--tools]
+#                            build a small sample project and check each feature (docker
+#                            agent, checkout, secrets, labels, library, artifacts, cleanup);
+#                            --tools also installs and runs a JDK and Maven (~200 MB, once)
 #   jenkins-local start      start Jenkins (http://127.0.0.1:8090)
 #   jenkins-local restart    rebuild the image and recreate the container; needed after editing
 #                            Dockerfile or plugins.txt
@@ -40,6 +43,16 @@
 # A build that loads a registered library (@Library('NAME'), @Library('NAME@v1'),
 # library 'NAME') gets that repo's working tree, uncommitted changes included, whatever
 # version it asks for. Unregistered ones are reported.
+#
+#   jenkins-local tool add maven|jdk NAME VERSION
+#                                     define an auto-installing tool for tools { } / tool:
+#                                     Maven VERSION (3.9.9), or a Temurin JDK release
+#                                     (jdk-21.0.5+11) or major (21, its latest release)
+#   jenkins-local tool list           defined tools
+#   jenkins-local tool rm maven|jdk NAME
+# A tool the Jenkinsfile names but Jenkins lacks is defined from its name when that says
+# enough (maven '3.9.9', jdk 'jdk21'); otherwise the build prints the command to run.
+# tools { } only applies outside docker agents, as on any Jenkins.
 #
 # No commit needed: each build is a Multibranch build of a snapshot of the working tree (the
 # files git would commit: tracked + untracked, minus .gitignore'd ones like .venv and .env),
@@ -186,6 +199,128 @@ EOF
       ;;
     *) die "usage: jenkins-local lib add NAME PATH | lib list | lib rm NAME" ;;
   esac
+}
+
+# Tools (tools { maven '...' jdk '...' } / tool '...'): auto-installing tool definitions in
+# Jenkins, downloaded on first use into JENKINS_HOME/tools (Maven from Apache, the JDK from
+# Eclipse Temurin). A JDK version can be a Temurin release (jdk-21.0.5+11) or a major (21,
+# the latest release of it). Prints what was defined.
+tool_define() {
+  local type=$1 tname=$2 version=$3
+  [[ "$tname" =~ ^[A-Za-z0-9_.+-]+$ ]] || die "tool name: letters, digits, . _ + - only (got '$tname')"
+  [[ "$version" =~ ^[A-Za-z0-9_.+-]+$ ]] || die "tool version: letters, digits, . _ + - only (got '$version')"
+  case "$type" in maven|jdk) ;; *) die "tool type must be maven or jdk (got '$type')" ;; esac
+  cli groovy = <<EOF
+import hudson.model.DownloadService
+import hudson.tools.InstallSourceProperty
+def j = jenkins.model.Jenkins.get()
+def type = '$type', name = '$tname', version = '$version'
+def data = { id -> def d = DownloadService.Downloadable.get(id); if (d.data == null) d.updateNow(); d.data }
+if (type == 'maven') {
+  if (!data('hudson.tasks.Maven.MavenInstaller').list.any { it.id == version }) { println("ERROR: no Maven " + version); return }
+  def d = j.getDescriptorByType(hudson.tasks.Maven.MavenInstallation.DescriptorImpl)
+  def t = new hudson.tasks.Maven.MavenInstallation(name, '', [new InstallSourceProperty([new hudson.tasks.Maven.MavenInstaller(version)])])
+  d.setInstallations((d.installations.findAll { it.name != name } + [t]) as hudson.tasks.Maven.MavenInstallation[])
+  d.save()
+  println("maven " + name + ": Apache Maven " + version)
+} else {
+  def releases = data('io.jenkins.plugins.adoptopenjdk.AdoptOpenJDKInstaller').data.findAll { it.name ==~ /.*HotSpot.*/ }
+  def release = version ==~ /\d+/ \
+    ? releases.find { it.name ==~ /OpenJDK ${version} - .*/ }?.releases?.getAt(0)?.release_name \
+    : releases.collectMany { it.releases*.release_name }.find { it == version }
+  if (!release) { println("ERROR: no Temurin JDK " + version); return }
+  def d = j.getDescriptorByType(hudson.model.JDK.DescriptorImpl)
+  def t = new hudson.model.JDK(name, '', [new InstallSourceProperty([new io.jenkins.plugins.adoptopenjdk.AdoptOpenJDKInstaller(release)])])
+  d.setInstallations((d.installations.findAll { it.name != name } + [t]) as hudson.model.JDK[])
+  d.save()
+  println("jdk " + name + ": Temurin " + release)
+}
+EOF
+}
+
+# Defined tools, as "type<TAB>name" lines.
+tool_names() {
+  cli groovy = <<'EOF'
+def j = jenkins.model.Jenkins.get()
+j.getDescriptorByType(hudson.tasks.Maven.MavenInstallation.DescriptorImpl).installations.each { println("maven\t" + it.name) }
+j.getDescriptorByType(hudson.model.JDK.DescriptorImpl).installations.each { println("jdk\t" + it.name) }
+EOF
+}
+
+tool() {
+  case "${1:-}" in
+    add)
+      [ $# -eq 4 ] || die "usage: jenkins-local tool add maven|jdk NAME VERSION"
+      start
+      local out
+      out=$(tool_define "$2" "$3" "$4")
+      case "$out" in ERROR:*) die "${out#ERROR: }" ;; esac
+      echo "$out" >&2
+      ;;
+    list)
+      running || die "Jenkins is not running (jenkins-local start)"
+      tool_names | awk -F'\t' '{ printf "%-6s %s\n", $1, $2 }'
+      ;;
+    rm)
+      [ $# -eq 3 ] || die "usage: jenkins-local tool rm maven|jdk NAME"
+      running || die "Jenkins is not running (jenkins-local start)"
+      local desc
+      case "$2" in
+        maven) desc=hudson.tasks.Maven.MavenInstallation ;;
+        jdk) desc=hudson.model.JDK ;;
+        *) die "tool type must be maven or jdk" ;;
+      esac
+      cli groovy = <<EOF >/dev/null
+def d = jenkins.model.Jenkins.get().getDescriptorByType(${desc}.DescriptorImpl)
+d.setInstallations(d.installations.findAll { it.name != '$3' } as ${desc}[])
+d.save()
+EOF
+      echo "removed $2 $3 (downloaded files stay in $home/tools until: jenkins-local prune)" >&2
+      ;;
+    *) die "usage: jenkins-local tool add maven|jdk NAME VERSION | tool list | tool rm maven|jdk NAME" ;;
+  esac
+}
+
+# Tools a Jenkinsfile uses, as "type<TAB>name" lines: entries of tools { } blocks (type is
+# the directive: maven, jdk, gradle...) and scripted tool name: 'x', type: 'maven'. A bare
+# tool 'x' has no type and is left out.
+jenkinsfile_tools() {
+  perl -0777 -ne '
+    while (/\btools\s*\{([^}]*)\}/g) { my $b = $1; while ($b =~ /\b(\w+)\s+["\x27]([^"\x27]+)["\x27]/g) { print "$1\t$2\n" } }
+    while (/\btool\s*\(?\s*name\s*:\s*["\x27]([^"\x27]+)["\x27]\s*,\s*type\s*:\s*["\x27]([^"\x27]+)["\x27]/g) { print "$2\t$1\n" }
+  ' "$1" | sort -u || true
+}
+
+# Define the tools a Jenkinsfile names but Jenkins lacks, when the name says enough: a Maven
+# name with a version (3.9.9, maven-3.9.9) installs that version, a JDK name with a major
+# (jdk21, temurin-17) the latest release of it. Others are reported with the command to run.
+ensure_tools() {
+  local wanted have type tname version out
+  wanted=$(jenkinsfile_tools "$1")
+  [ -n "$wanted" ] || return 0
+  have=$(tool_names)
+  while IFS=$'\t' read -r type tname; do
+    grep -qxF "$type"$'\t'"$tname" <<< "$have" && continue
+    version=""
+    case "$type" in
+      maven) version=$(grep -oE '[0-9]+\.[0-9]+(\.[0-9]+)*' <<< "$tname" | awk 'NR == 1' || true) ;;
+      jdk) version=$(grep -oE '[0-9]+' <<< "$tname" | awk 'NR == 1' || true) ;;
+      *)
+        echo "jenkins-local: tool type '$type' ('$tname') is not supported; only maven and jdk." >&2
+        continue
+        ;;
+    esac
+    if [ -z "$version" ]; then
+      echo "jenkins-local: the Jenkinsfile uses $type '$tname', which is not defined:" >&2
+      echo "  jenkins-local tool add $type $tname VERSION" >&2
+      continue
+    fi
+    out=$(tool_define "$type" "$tname" "$version")
+    case "$out" in
+      ERROR:*) echo "jenkins-local: $type '$tname': ${out#ERROR: }; define it with: jenkins-local tool add $type $tname VERSION" >&2 ;;
+      *) echo "Tool $out (installed on first use)" >&2 ;;
+    esac
+  done <<< "$wanted"
 }
 
 # Shared libraries a Jenkinsfile loads, as "name<TAB>version" lines (version empty when not
@@ -522,7 +657,7 @@ kb_to_human() { awk -v k="$1" 'BEGIN { split("K M G T", u); i = 1; while (k >= 1
 # The biggest things in JENKINS_HOME, largest first.
 usage_breakdown() {
   # du fails on a pattern that matches nothing (no jobs yet); what it did measure still counts.
-  (cd "$home" && du -sk workspace/* jobs/*/branches/*/builds sources/* plugins war 2>/dev/null || true) \
+  (cd "$home" && du -sk workspace/* jobs/*/branches/*/builds sources/* tools/*/* plugins war 2>/dev/null || true) \
     | sort -rn | awk -v n="${1:-8}" 'NR <= n' | while read -r kb path; do
       printf '  %8s  %s\n' "$(kb_to_human "$kb")" "$path"
     done
@@ -570,7 +705,8 @@ status() {
 }
 
 # Workspaces are only needed while a build runs; anything left (a --keep-workspace build,
-# an interrupted one, a job that was moved or deleted) goes. Build logs are kept.
+# an interrupted one, a job that was moved or deleted) goes. Downloaded tools go too: they
+# come back on next use. Build logs are kept.
 prune() {
   if running; then
     local busy
@@ -579,14 +715,21 @@ prune() {
   fi
   local before after
   before=$(du -sk "$home" | cut -f1)
-  rm -rf "${home:?}/workspace" "$home"/.job-*.xml
+  rm -rf "${home:?}/workspace" "$home/tools" "$home"/.job-*.xml "$home"/.build-log.* "$home"/.index.*
   after=$(du -sk "$home" | cut -f1)
   echo "Freed $(kb_to_human $((before - after))); $home is now $(kb_to_human "$after")."
 }
 
 # Build ../selftest/Jenkinsfile as a throwaway repo, then check from outside what the build
-# can't see itself. Leaves nothing behind but the pulled alpine image.
+# can't see itself. Leaves nothing behind but the pulled alpine image (and, with --tools,
+# the downloaded JDK and Maven, until prune).
 selftest() {
+  local with_tools=0
+  case "${1:-}" in
+    --tools) with_tools=1 ;;
+    "") ;;
+    *) die "usage: jenkins-local selftest [--tools]" ;;
+  esac
   # Not `name`: that is the container's, and bash locals are visible to called functions.
   local sample=jenkins-local-selftest
   local src=$home/selftest/$sample log=$home/selftest/build.log
@@ -633,17 +776,26 @@ EOF
   printf '%s\n' 'def call() { return "hello-from-lib" }' > "$libsrc/vars/selftestGreet.groovy"
   git -C "$libsrc" init -q
   lib add jenkins-local-selftest-lib "$libsrc" 2>/dev/null
+  local stages=("Docker agent" "Workspace" "SCM checkout" "Secret from .env" "Agent label"
+    "Credential types" "Shared library")
+  if [ "$with_tools" = 1 ]; then
+    touch "$src/with-tools"
+    stages+=("Tools")
+  fi
+  stages+=("Artifact and test report")
 
   echo "Building the sample project (first run pulls alpine:3.20)..." >&2
   (cd "$src" && build) > "$log" 2>&1 || rc=$?
   lib rm jenkins-local-selftest-lib 2>/dev/null || true
+  # The Jenkinsfile names these tools whether or not the stage runs; don't leave them defined.
+  tool rm jdk selftest-jdk21 2>/dev/null || true
+  tool rm maven selftest-maven-3.9.9 2>/dev/null || true
   build_dir=$(ls -d "$home/jobs/$sample/branches/"*/builds 2>/dev/null | head -1 || true)
   n=$(ls "$build_dir" 2>/dev/null | grep -E '^[0-9]+$' | sort -n | tail -1 || true)
 
   echo "jenkins-local selftest:"
   check "build passed" '[ "$rc" = 0 ]'
-  for stage in "Docker agent" "Workspace" "SCM checkout" "Secret from .env" "Agent label" "Credential types" \
-      "Shared library" "Artifact and test report"; do
+  for stage in "${stages[@]}"; do
     check "stage: $stage" 'stage_ok "$stage"'
   done
   check "artifact archived" '[ "$(cat "$build_dir/$n/archive/artifact.txt" 2>/dev/null)" = selftest-ok ]'
@@ -725,6 +877,7 @@ build() {
   cli get-job "$job" >/dev/null 2>&1 || index_branch "$project" "$job"
   ensure_labels "$repo/Jenkinsfile"
   ensure_libraries "$repo/Jenkinsfile"
+  ensure_tools "$repo/Jenkinsfile"
 
   warn_if_big
   echo "Building $project » $branch (working tree at ${commit:0:8}): http://127.0.0.1:$port/job/$project/job/$(branch_job_name "$branch")/" >&2
@@ -755,12 +908,13 @@ case "${1:-build}" in
   start) start ;;
   status) status ;;
   prune) prune ;;
-  selftest) selftest ;;
+  selftest) shift; selftest "$@" ;;
   restart) docker rm -f "$name" >/dev/null 2>&1 || true; start ;;
   stop) docker rm -f "$name" >/dev/null 2>&1 || true; echo "stopped (data kept in $home)" ;;
   logs) docker logs -f "$name" ;;
   secret) shift; secret "$@" ;;
   lib) shift; lib "$@" ;;
+  tool) shift; tool "$@" ;;
   -h|--help|help) sed -n '2,/^set -euo/p' "$0" | sed '$d; s/^# \{0,1\}//' ;;
   *) die "unknown command '$1' (see: jenkins-local help)" ;;
 esac

@@ -5,97 +5,121 @@
 @Library('jenkins-local-selftest-lib@v1') _
 
 pipeline {
-    // Docker Pipeline plugin + docker CLI + socket + same-path workspace mount.
-    agent { docker { image 'alpine:3.20' } }
+    // Each top-level stage brings its own agent: tools { } can't work inside a docker
+    // agent (Jenkins can't set PATH in a container, and the JDK needs glibc).
+    agent none
 
     stages {
-        stage('Docker agent') {
-            steps {
-                sh 'echo "alpine $(cat /etc/alpine-release), uid $(id -u)"'
-            }
-        }
-
-        // The workspace is a checkout of the working-tree snapshot: untracked files in,
-        // .gitignore'd ones out.
-        stage('Workspace') {
-            steps {
-                sh 'test -d .git && test -f Jenkinsfile && test -f marker.txt && test ! -e ignored.txt'
-            }
-        }
-
-        // A Multibranch job: BRANCH_NAME is the repo's branch, and `checkout scm` works.
-        // On the built-in node, which has git (alpine doesn't).
-        stage('SCM checkout') {
+        // Only with `selftest --tools` (downloads a JDK, ~200 MB, once). jenkins-local defines
+        // both from their names: Maven 3.9.9, the latest Temurin 21. First, so that a failure
+        // here shows as the later stages being skipped.
+        stage('Tools') {
             agent any
+            when { expression { fileExists 'with-tools' } }
+            tools {
+                jdk 'selftest-jdk21'
+                maven 'selftest-maven-3.9.9'
+            }
             steps {
-                checkout scm
-                sh '[ "$BRANCH_NAME" = "selftest/main" ] && [ -n "$GIT_COMMIT" ] && test -f marker.txt'
-                // selftest compares it with the snapshot it just made: no stale revision.
-                sh 'echo "selftest-commit=$GIT_COMMIT"'
+                sh 'java -version 2>&1 | grep -q "version \\"21" && mvn -v | grep -q "Apache Maven 3.9.9"'
             }
         }
 
-        // SELFTEST_TOKEN comes from the sample's .env (a folder credential).
-        stage('Secret from .env') {
-            steps {
-                withCredentials([string(credentialsId: 'SELFTEST_TOKEN', variable: 'T')]) {
-                    sh '[ "$T" = "from-dotenv" ]'
+        stage('In a docker agent') {
+            // Docker Pipeline plugin + docker CLI + socket + same-path workspace mount.
+            agent { docker { image 'alpine:3.20' } }
+
+            stages {
+                stage('Docker agent') {
+                    steps {
+                        sh 'echo "alpine $(cat /etc/alpine-release), uid $(id -u)"'
+                    }
+                }
+
+                // The workspace is a checkout of the working-tree snapshot: untracked files
+                // in, .gitignore'd ones out.
+                stage('Workspace') {
+                    steps {
+                        sh 'test -d .git && test -f Jenkinsfile && test -f marker.txt && test ! -e ignored.txt'
+                    }
+                }
+
+                // A Multibranch job: BRANCH_NAME is the repo's branch, and `checkout scm`
+                // works. On the built-in node, which has git (alpine doesn't).
+                stage('SCM checkout') {
+                    agent any
+                    steps {
+                        checkout scm
+                        sh '[ "$BRANCH_NAME" = "selftest/main" ] && [ -n "$GIT_COMMIT" ] && test -f marker.txt'
+                        // selftest compares it with the snapshot it just made: no stale revision.
+                        sh 'echo "selftest-commit=$GIT_COMMIT"'
+                    }
+                }
+
+                // SELFTEST_TOKEN comes from the sample's .env (a folder credential).
+                stage('Secret from .env') {
+                    steps {
+                        withCredentials([string(credentialsId: 'SELFTEST_TOKEN', variable: 'T')]) {
+                            sh '[ "$T" = "from-dotenv" ]'
+                        }
+                    }
+                }
+
+                // jenkins-local gives this machine every label the Jenkinsfile asks for.
+                // Without that, this stage would wait for an agent forever; the timeout makes
+                // it fail.
+                stage('Agent label') {
+                    options { timeout(time: 2, unit: 'MINUTES') }
+                    agent { label 'selftest-label && selftest-gpu' }
+                    steps {
+                        sh 'true'
+                    }
+                }
+
+                // From .env naming: _USR/_PSW -> usernamePassword, _FILE -> file,
+                // _SSH_KEY (+ _SSH_USER) -> sshUserPrivateKey.
+                stage('Credential types') {
+                    steps {
+                        withCredentials([
+                            usernamePassword(credentialsId: 'SELFTEST_LOGIN', usernameVariable: 'U', passwordVariable: 'P'),
+                            file(credentialsId: 'SELFTEST_CERT', variable: 'CERT'),
+                            sshUserPrivateKey(credentialsId: 'SELFTEST_DEPLOY', keyFileVariable: 'KEY', usernameVariable: 'KU')
+                        ]) {
+                            sh '''
+                                [ "$U" = "robot" ] && [ "$P" = "pa ss#word" ]
+                                [ "$(cat "$CERT")" = "certificate-content" ]
+                                grep -q "BEGIN OPENSSH PRIVATE KEY" "$KEY" && [ "$KU" = "deployer" ]
+                            '''
+                        }
+                    }
+                }
+
+                stage('Shared library') {
+                    steps {
+                        script {
+                            if (selftestGreet() != 'hello-from-lib') { error 'shared library step returned the wrong value' }
+                        }
+                    }
+                }
+
+                stage('Artifact and test report') {
+                    steps {
+                        sh '''
+                            echo selftest-ok > artifact.txt
+                            mkdir -p reports
+                            printf '%s\n' '<testsuite name="selftest" tests="1">' \
+                                '<testcase classname="selftest" name="works"/></testsuite>' > reports/junit.xml
+                        '''
+                    }
                 }
             }
-        }
 
-        // jenkins-local gives this machine every label the Jenkinsfile asks for. Without
-        // that, this stage would wait for an agent forever; the timeout makes it fail.
-        stage('Agent label') {
-            options { timeout(time: 2, unit: 'MINUTES') }
-            agent { label 'selftest-label && selftest-gpu' }
-            steps {
-                sh 'true'
-            }
-        }
-
-        // From .env naming: _USR/_PSW -> usernamePassword, _FILE -> file,
-        // _SSH_KEY (+ _SSH_USER) -> sshUserPrivateKey.
-        stage('Credential types') {
-            steps {
-                withCredentials([
-                    usernamePassword(credentialsId: 'SELFTEST_LOGIN', usernameVariable: 'U', passwordVariable: 'P'),
-                    file(credentialsId: 'SELFTEST_CERT', variable: 'CERT'),
-                    sshUserPrivateKey(credentialsId: 'SELFTEST_DEPLOY', keyFileVariable: 'KEY', usernameVariable: 'KU')
-                ]) {
-                    sh '''
-                        [ "$U" = "robot" ] && [ "$P" = "pa ss#word" ]
-                        [ "$(cat "$CERT")" = "certificate-content" ]
-                        grep -q "BEGIN OPENSSH PRIVATE KEY" "$KEY" && [ "$KU" = "deployer" ]
-                    '''
+            post {
+                always {
+                    archiveArtifacts artifacts: 'artifact.txt'
+                    junit 'reports/junit.xml'
                 }
             }
-        }
-
-        stage('Shared library') {
-            steps {
-                script {
-                    if (selftestGreet() != 'hello-from-lib') { error 'shared library step returned the wrong value' }
-                }
-            }
-        }
-
-        stage('Artifact and test report') {
-            steps {
-                sh '''
-                    echo selftest-ok > artifact.txt
-                    mkdir -p reports
-                    printf '%s\n' '<testsuite name="selftest" tests="1">' \
-                        '<testcase classname="selftest" name="works"/></testsuite>' > reports/junit.xml
-                '''
-            }
-        }
-    }
-
-    post {
-        always {
-            archiveArtifacts artifacts: 'artifact.txt'
-            junit 'reports/junit.xml'
         }
     }
 }
