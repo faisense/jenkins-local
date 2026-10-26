@@ -5,8 +5,13 @@
 #                            now, stream the log, exit with the build's result (starts Jenkins
 #                            if needed). The repo's .env, if there is one, supplies its secrets:
 #                            each KEY=value line, overriding a global secret of the same ID,
-#                            for this repo only.
-#   jenkins-local -e FILE    use another env file instead (--env-file)
+#                            for this repo only. Key names set the credential type:
+#                              X_USR + X_PSW       usernamePassword X
+#                              X_FILE=path         file X (path relative to the env file)
+#                              X_SSH_KEY=path      sshUserPrivateKey X (+ X_SSH_USER, default
+#                                                  git, and X_SSH_PASSPHRASE)
+#                              anything else       secret text
+#   jenkins-local -e FILE   use another env file instead (--env-file)
 #   jenkins-local --no-env   no repo secrets; only the global ones apply
 #   jenkins-local --keep-workspace
 #                            keep the build's workspace afterwards (deleted by default)
@@ -191,6 +196,89 @@ read_env_file() {
   done < "$1"
 }
 
+# The credentials an env file defines, one "type<TAB>ID" line each. The type comes from the
+# key names, following Jenkins' own naming where it has one:
+#   X_USR + X_PSW                     usernamePassword X (the variables credentials('X') sets)
+#   X_FILE=path                       file X, with that file's content
+#   X_SSH_KEY=path [+ X_SSH_USER, X_SSH_PASSPHRASE]
+#                                     sshUserPrivateKey X (user defaults to git)
+#   anything else                     string (secret text), ID = the key
+# Paths are relative to the env file. Keys used by a pair or a key are not also strings.
+env_credentials() {
+  local entries key base
+  entries=$(read_env_file "$1")
+  has() { awk -F'\t' -v k="$1" '$1 == k { f = 1 } END { exit !f }' <<< "$entries"; }
+  while IFS=$'\t' read -r key _; do
+    [ -n "$key" ] || continue
+    case "$key" in
+      *_USR) base=${key%_USR}; if has "${base}_PSW"; then printf 'usernamePassword\t%s\n' "$base"; continue; fi ;;
+      *_PSW) base=${key%_PSW}; has "${base}_USR" && continue ;;
+      *_SSH_KEY) printf 'sshUserPrivateKey\t%s\n' "${key%_SSH_KEY}"; continue ;;
+      *_SSH_USER) has "${key%_SSH_USER}_SSH_KEY" && continue ;;
+      *_SSH_PASSPHRASE) has "${key%_SSH_PASSPHRASE}_SSH_KEY" && continue ;;
+      *_FILE) printf 'file\t%s\n' "${key%_FILE}"; continue ;;
+    esac
+    printf 'string\t%s\n' "$key"
+  done <<< "$entries"
+}
+
+# Value of KEY in an env file (empty if absent).
+env_value() { read_env_file "$1" | awk -F'\t' -v k="$2" '$1 == k { print substr($0, length(k) + 2); exit }'; }
+
+# An env file path value, resolved against the env file's directory; must exist.
+env_path() {
+  local p
+  p=$(env_value "$1" "$2")
+  case "$p" in /*) ;; *) p=$(dirname "$1")/$p ;; esac
+  [ -f "$p" ] || die "$2 in $1 points to a missing file: $p"
+  printf '%s' "$p"
+}
+
+# The <credentials> entries for an env file, per env_credentials. Values in plain text.
+credentials_xml() {
+  local env_file=$1 type id desc path
+  desc=$(xml_escape <<< "from $env_file")
+  while IFS=$'\t' read -r type id; do
+    case "$type" in
+      string)
+        echo "          <org.jenkinsci.plugins.plaincredentials.impl.StringCredentialsImpl>"
+        echo "            <scope>GLOBAL</scope><id>$id</id><description>$desc</description>"
+        echo "            <secret>$(env_value "$env_file" "$id" | xml_escape)</secret>"
+        echo "          </org.jenkinsci.plugins.plaincredentials.impl.StringCredentialsImpl>"
+        ;;
+      usernamePassword)
+        echo "          <com.cloudbees.plugins.credentials.impl.UsernamePasswordCredentialsImpl>"
+        echo "            <scope>GLOBAL</scope><id>$id</id><description>$desc</description>"
+        echo "            <username>$(env_value "$env_file" "${id}_USR" | xml_escape)</username>"
+        echo "            <password>$(env_value "$env_file" "${id}_PSW" | xml_escape)</password>"
+        echo "            <usernameSecret>false</usernameSecret>"
+        echo "          </com.cloudbees.plugins.credentials.impl.UsernamePasswordCredentialsImpl>"
+        ;;
+      file)
+        path=$(env_path "$env_file" "${id}_FILE")
+        echo "          <org.jenkinsci.plugins.plaincredentials.impl.FileCredentialsImpl>"
+        echo "            <scope>GLOBAL</scope><id>$id</id><description>$desc</description>"
+        echo "            <fileName>$(basename "$path" | xml_escape)</fileName>"
+        echo "            <secretBytes>$(base64 < "$path" | tr -d '\n')</secretBytes>"
+        echo "          </org.jenkinsci.plugins.plaincredentials.impl.FileCredentialsImpl>"
+        ;;
+      sshUserPrivateKey)
+        path=$(env_path "$env_file" "${id}_SSH_KEY")
+        local user
+        user=$(env_value "$env_file" "${id}_SSH_USER"); user=${user:-git}
+        echo "          <com.cloudbees.jenkins.plugins.sshcredentials.impl.BasicSSHUserPrivateKey>"
+        echo "            <scope>GLOBAL</scope><id>$id</id><description>$desc</description>"
+        echo "            <username>$(xml_escape <<< "$user")</username><usernameSecret>false</usernameSecret>"
+        echo "            <privateKeySource class=\"com.cloudbees.jenkins.plugins.sshcredentials.impl.BasicSSHUserPrivateKey\$DirectEntryPrivateKeySource\">"
+        echo "              <privateKey>$(xml_escape < "$path")</privateKey>"
+        echo "            </privateKeySource>"
+        echo "            <passphrase>$(env_value "$env_file" "${id}_SSH_PASSPHRASE" | xml_escape)</passphrase>"
+        echo "          </com.cloudbees.jenkins.plugins.sshcredentials.impl.BasicSSHUserPrivateKey>"
+        ;;
+    esac
+  done < <(env_credentials "$env_file")
+}
+
 # Config of the repo's Multibranch project: branches come from the repo's snapshot remote
 # (see snapshot), so builds get a real checkout, `checkout scm` and BRANCH_NAME as on a CI
 # server. Branch jobs are only built on request (NoTriggerBranchProperty), never on indexing.
@@ -234,13 +322,7 @@ project_xml() {
     echo "      <domainCredentialsMap class=\"hudson.util.CopyOnWriteMap\$Hash\"><entry>"
     echo "        <com.cloudbees.plugins.credentials.domains.Domain><specifications/></com.cloudbees.plugins.credentials.domains.Domain>"
     echo "        <java.util.concurrent.CopyOnWriteArrayList>"
-    while IFS=$'\t' read -r key val; do
-      echo "          <org.jenkinsci.plugins.plaincredentials.impl.StringCredentialsImpl>"
-      echo "            <scope>GLOBAL</scope><id>$key</id>"
-      echo "            <description>$(xml_escape <<< "from $env_file")</description>"
-      echo "            <secret>$(xml_escape <<< "$val")</secret>"
-      echo "          </org.jenkinsci.plugins.plaincredentials.impl.StringCredentialsImpl>"
-    done < <(read_env_file "$env_file")
+    credentials_xml "$env_file"
     echo "        </java.util.concurrent.CopyOnWriteArrayList>"
     echo "      </entry></domainCredentialsMap>"
     echo "    </com.cloudbees.hudson.plugins.folder.properties.FolderCredentialsProvider_-FolderCredentialsProperty>"
@@ -381,8 +463,19 @@ selftest() {
   cp "$(dirname "$conf")/selftest/Jenkinsfile" "$src/"
   echo "copied into the workspace" > "$src/marker.txt"
   echo "must not be copied" > "$src/ignored.txt"
-  printf 'ignored.txt\n.env\n' > "$src/.gitignore"
-  echo "SELFTEST_TOKEN=from-dotenv" > "$src/.env"
+  printf 'ignored.txt\n.env\nsecrets/\n' > "$src/.gitignore"
+  mkdir -p "$src/secrets"
+  printf 'certificate-content' > "$src/secrets/cert.txt"
+  printf '%s\n' '-----BEGIN OPENSSH PRIVATE KEY-----' 'not-a-real-key' '-----END OPENSSH PRIVATE KEY-----' \
+    > "$src/secrets/deploy_key"
+  cat > "$src/.env" <<'EOF'
+SELFTEST_TOKEN=from-dotenv
+SELFTEST_LOGIN_USR=robot
+SELFTEST_LOGIN_PSW="pa ss#word"
+SELFTEST_CERT_FILE=secrets/cert.txt
+SELFTEST_DEPLOY_SSH_KEY=secrets/deploy_key
+SELFTEST_DEPLOY_SSH_USER=deployer
+EOF
   # On a branch with a slash, to check the branch job's name and BRANCH_NAME.
   git -C "$src" init -q -b selftest/main
 
@@ -393,7 +486,8 @@ selftest() {
 
   echo "jenkins-local selftest:"
   check "build passed" '[ "$rc" = 0 ]'
-  for stage in "Docker agent" "Workspace" "SCM checkout" "Secret from .env" "Artifact and test report"; do
+  for stage in "Docker agent" "Workspace" "SCM checkout" "Secret from .env" "Credential types" \
+      "Artifact and test report"; do
     check "stage: $stage" 'stage_ok "$stage"'
   done
   check "artifact archived" '[ "$(cat "$build_dir/$n/archive/artifact.txt" 2>/dev/null)" = selftest-ok ]'
@@ -441,6 +535,10 @@ build() {
   branch=$(git -C "$repo" branch --show-current); branch=${branch:-detached}
   job=$project/$(branch_job_name "$branch")
 
+  # Fail here on a bad env file (a missing X_FILE...), not halfway through piping the
+  # project config into the CLI.
+  [ -z "$env_file" ] || credentials_xml "$env_file" > /dev/null
+
   commit=$(snapshot "$repo" "$remote" "$branch")
 
   # Older jenkins-local versions made a plain folder (or job) here; that one is replaced.
@@ -453,7 +551,8 @@ build() {
     project_xml "$env_file" "Local builds of $repo (managed by jenkins-local)" "$remote" | cli create-job "$project"
   fi
   if [ -n "$env_file" ]; then
-    echo "Secrets from $env_file: $(read_env_file "$env_file" | cut -f1 | paste -sd' ')" >&2
+    echo "Secrets from $env_file: $(env_credentials "$env_file" \
+      | awk -F'\t' '{ printf "%s%s", sep, $2 ($1 == "string" ? "" : " (" $1 ")"); sep = " " }')" >&2
   fi
   cli get-job "$job" >/dev/null 2>&1 || index_branch "$project" "$job"
 
