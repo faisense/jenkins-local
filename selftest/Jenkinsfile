@@ -1,5 +1,9 @@
 // Built by `jenkins-local selftest`. Each stage exercises one thing a real Jenkinsfile relies
 // on; the command then checks the results from outside. Keep it small and quick.
+
+// Registered by selftest from a local, uncommitted repo; any version gets the working tree.
+@Library('jenkins-local-selftest-lib@v1') _
+
 pipeline {
     // Docker Pipeline plugin + docker CLI + socket + same-path workspace mount.
     agent { docker { image 'alpine:3.20' } }
@@ -64,6 +68,14 @@ pipeline {
                         [ "$(cat "$CERT")" = "certificate-content" ]
                         grep -q "BEGIN OPENSSH PRIVATE KEY" "$KEY" && [ "$KU" = "deployer" ]
                     '''
+                }
+            }
+        }
+
+        stage('Shared library') {
+            steps {
+                script {
+                    if (selftestGreet() != 'hello-from-lib') { error 'shared library step returned the wrong value' }
                 }
             }
         }
