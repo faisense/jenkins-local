@@ -120,4 +120,7 @@ and suffixed by Jenkins, e.g. `feature-x.1ttbu8`) and go when their build is dis
 
 Settings: `JENKINS_LOCAL_PORT` (default 8090), `JENKINS_LOCAL_WARN_GB` (default 5).
 
-Needs: bash, git, perl, curl, and Docker usable without sudo.
+Needs: bash (3.2 or later), git, perl, curl, and Docker usable without sudo. Runs on Linux;
+on macOS it is written for Docker Desktop (no GNU tools needed, checked under bash 3.2 and
+BusyBox) but not yet tried on a Mac. The data folder must be shared with Docker, which
+Docker Desktop does for your home folder by default.
