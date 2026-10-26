@@ -1,0 +1,8 @@
+configuration-as-code
+workflow-aggregator
+docker-workflow
+git
+credentials-binding
+plain-credentials
+junit
+pipeline-stage-view
