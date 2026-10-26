@@ -38,6 +38,16 @@ pipeline {
             }
         }
 
+        // jenkins-local gives this machine every label the Jenkinsfile asks for. Without
+        // that, this stage would wait for an agent forever; the timeout makes it fail.
+        stage('Agent label') {
+            options { timeout(time: 2, unit: 'MINUTES') }
+            agent { label 'selftest-label && selftest-gpu' }
+            steps {
+                sh 'true'
+            }
+        }
+
         // From .env naming: _USR/_PSW -> usernamePassword, _FILE -> file,
         // _SSH_KEY (+ _SSH_USER) -> sshUserPrivateKey.
         stage('Credential types') {

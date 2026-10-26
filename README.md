@@ -23,7 +23,10 @@ Pipeline plugin, so `agent { docker { image '...' } }` works.
 3. Creates or updates a Multibranch project named after the repo, reading that snapshot
    repo, so the build is a real checkout: `checkout scm`, `BRANCH_NAME` and `GIT_COMMIT`
    work as on a CI server. Each branch gets its own job (`<repo> » <branch>`).
-4. Runs that branch's job, streams the log, deletes the workspace, and exits 0 on success.
+4. Gives this machine every agent label the Jenkinsfile asks for (`agent { label 'gpu' }`,
+   `docker { label ... }`, `node('linux && x64')`): it is the only agent, and otherwise such
+   a stage would wait forever. Labels are only added, and `status` lists them.
+5. Runs that branch's job, streams the log, deletes the workspace, and exits 0 on success.
 
 ## Secrets
 
