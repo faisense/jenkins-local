@@ -56,6 +56,17 @@ Pipeline plugin, so `agent { docker { image '...' } }` works.
 | `jenkins-local selftest` | build `selftest/Jenkinsfile` as a throwaway repo and check each feature (docker agent, workspace, `.env` secret, artifacts, test report, cleanup); leaves nothing behind when all pass |
 | `jenkins-local start` / `stop` / `restart` / `logs` | the Jenkins container; `restart` after editing `config/` |
 | `jenkins-local secret set\|list\|rm` | global secrets |
+| `jenkins-local lib add NAME PATH` / `lib list` / `lib rm NAME` | shared libraries (below) |
+
+## Shared libraries
+
+`jenkins-local lib add pipeline-utils ~/src/pipeline-utils` registers a local git repo as the
+library `pipeline-utils`. A Jenkinsfile that loads it (`@Library('pipeline-utils')`,
+`@Library('pipeline-utils@v2') _`, `library 'pipeline-utils'`) gets that repo's working
+tree, uncommitted changes included, whatever version it asks for: each build snapshots it
+like the repo itself and defines it as a global library. A library the Jenkinsfile loads but
+that isn't registered is reported before the build (which then fails on it).
+`library(identifier: ..., retriever: ...)` brings its own source and is left alone.
 
 ## Disk use
 

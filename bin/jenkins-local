@@ -34,6 +34,13 @@
 # A Jenkinsfile uses them with withCredentials([string(credentialsId: 'ID', variable: ...)]).
 # Changes apply to a running Jenkins at once; no restart.
 #
+#   jenkins-local lib add NAME PATH   register a local git repo as shared library NAME
+#   jenkins-local lib list            registered libraries
+#   jenkins-local lib rm NAME         unregister one
+# A build that loads a registered library (@Library('NAME'), @Library('NAME@v1'),
+# library 'NAME') gets that repo's working tree, uncommitted changes included, whatever
+# version it asks for. Unregistered ones are reported.
+#
 # No commit needed: each build is a Multibranch build of a snapshot of the working tree (the
 # files git would commit: tracked + untracked, minus .gitignore'd ones like .venv and .env),
 # so `checkout scm`, BRANCH_NAME and GIT_COMMIT work as on a CI server.
@@ -60,6 +67,8 @@ home=${XDG_DATA_HOME:-$HOME/.local/share}/jenkins-local
 port=${JENKINS_LOCAL_PORT:-8090}
 warn_gb=${JENKINS_LOCAL_WARN_GB:-5}
 secrets=${XDG_CONFIG_HOME:-$HOME/.config}/jenkins-local/secrets
+# Shared libraries registered with `lib add`: "name<TAB>path" lines.
+libraries=${XDG_CONFIG_HOME:-$HOME/.config}/jenkins-local/libraries
 name=jenkins-local
 image=jenkins-local
 
@@ -140,6 +149,87 @@ secret() {
 # Letters, digits and _ only: the ID is also the ${...} name JCasC resolves.
 valid_id() {
   [[ "${1:-}" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || die "secret ID must match [A-Za-z_][A-Za-z0-9_]* (got '${1:-}')"
+}
+
+# Path of a registered library (empty if not registered).
+lib_path() { [ -f "$libraries" ] && awk -F'\t' -v n="$1" '$1 == n { print $2; exit }' "$libraries" || true; }
+
+lib() {
+  local lname path
+  case "${1:-}" in
+    add)
+      lname=${2:-}; path=${3:-}
+      [[ "$lname" =~ ^[A-Za-z0-9_.-]+$ ]] || die "usage: jenkins-local lib add NAME PATH (NAME: letters, digits, . _ -)"
+      [ -n "$path" ] && path=$(cd "$path" 2>/dev/null && git rev-parse --show-toplevel 2>/dev/null) \
+        || die "${3:-PATH} is not a git repo"
+      mkdir -p "$(dirname "$libraries")"
+      { [ -f "$libraries" ] && awk -F'\t' -v n="$lname" '$1 != n' "$libraries"; printf '%s\t%s\n' "$lname" "$path"; } \
+        > "$libraries.tmp" && mv "$libraries.tmp" "$libraries"
+      echo "library $lname -> $path" >&2
+      ;;
+    list)
+      [ -f "$libraries" ] && awk -F'\t' '{ printf "%-24s %s\n", $1, $2 }' "$libraries" || true
+      ;;
+    rm)
+      lname=${2:-}
+      [ -n "$(lib_path "$lname")" ] || die "no library '$lname' (see: jenkins-local lib list)"
+      awk -F'\t' -v n="$lname" '$1 != n' "$libraries" > "$libraries.tmp" && mv "$libraries.tmp" "$libraries"
+      rm -rf "$home/sources/lib-$lname.git"
+      if running; then
+        cli groovy = <<EOF >/dev/null
+def g = org.jenkinsci.plugins.workflow.libs.GlobalLibraries.get()
+g.libraries = g.libraries.findAll { it.name != '$lname' }
+g.save()
+EOF
+      fi
+      echo "removed library $lname" >&2
+      ;;
+    *) die "usage: jenkins-local lib add NAME PATH | lib list | lib rm NAME" ;;
+  esac
+}
+
+# Shared libraries a Jenkinsfile loads, as "name<TAB>version" lines (version empty when not
+# given): @Library('a') / @Library(['a@1', 'b']) and scripted library('a@1') / library 'a'.
+# library(identifier: ..., retriever: ...) brings its own source and is left alone.
+jenkinsfile_libraries() {
+  perl -ne '
+    while (/\@Library\s*\(([^)]*)\)/g) { my $a = $1; while ($a =~ /["\x27]([^"\x27]+)["\x27]/g) { print "$1\n" } }
+    while (/\blibrary\s*\(?\s*["\x27]([^"\x27]+)["\x27]/g) { print "$1\n" }
+  ' "$1" | awk '{ i = index($0, "@"); if (i) print substr($0, 1, i - 1) "\t" substr($0, i + 1); else print $0 "\t" }' \
+    | sort -u || true
+}
+
+# Make each library the Jenkinsfile loads come from its registered working tree: snapshot
+# it (like the repo itself) to branch jenkins-local, and to every version the Jenkinsfile
+# asks for, so @Library('x@v1') also gets the local copy; then (re)define it as a global
+# library with that default. Unregistered ones are reported, not guessed.
+ensure_libraries() {
+  local lname version path remote commit missing=()
+  while IFS=$'\t' read -r lname version; do
+    [ -n "$lname" ] || continue
+    path=$(lib_path "$lname")
+    if [ -z "$path" ]; then missing+=("$lname"); continue; fi
+    [ -d "$path" ] || die "library $lname: $path is gone (jenkins-local lib add $lname NEW_PATH)"
+    remote=$home/sources/lib-$lname.git
+    commit=$(snapshot "$path" "$remote" jenkins-local)
+    if [ -n "$version" ] && [ "$version" != jenkins-local ]; then
+      git -C "$path" push -q --no-verify --force "$remote" "$commit:refs/heads/$version"
+    fi
+    cli groovy = <<EOF >/dev/null
+import org.jenkinsci.plugins.workflow.libs.*
+def g = GlobalLibraries.get()
+def lc = new LibraryConfiguration('$lname', new SCMSourceRetriever(new jenkins.plugins.git.GitSCMSource('file://$remote')))
+lc.defaultVersion = 'jenkins-local'
+lc.allowVersionOverride = true
+g.libraries = g.libraries.findAll { it.name != '$lname' } + [lc]
+g.save()
+EOF
+    echo "Library $lname${version:+@$version}: working tree of $path (${commit:0:8})" >&2
+  done < <(jenkinsfile_libraries "$1")
+  if [ ${#missing[@]} -gt 0 ]; then
+    echo "jenkins-local: the Jenkinsfile loads unregistered libraries: ${missing[*]}" >&2
+    echo "  register each with: jenkins-local lib add NAME PATH-TO-ITS-REPO" >&2
+  fi
 }
 
 start() {
@@ -537,16 +627,23 @@ SELFTEST_DEPLOY_SSH_USER=deployer
 EOF
   # On a branch with a slash, to check the branch job's name and BRANCH_NAME.
   git -C "$src" init -q -b selftest/main
+  # A shared library, uncommitted like the project: the Jenkinsfile loads it @v1.
+  local libsrc=$home/selftest/lib
+  mkdir -p "$libsrc/vars"
+  printf '%s\n' 'def call() { return "hello-from-lib" }' > "$libsrc/vars/selftestGreet.groovy"
+  git -C "$libsrc" init -q
+  lib add jenkins-local-selftest-lib "$libsrc" 2>/dev/null
 
   echo "Building the sample project (first run pulls alpine:3.20)..." >&2
   (cd "$src" && build) > "$log" 2>&1 || rc=$?
+  lib rm jenkins-local-selftest-lib 2>/dev/null || true
   build_dir=$(ls -d "$home/jobs/$sample/branches/"*/builds 2>/dev/null | head -1 || true)
   n=$(ls "$build_dir" 2>/dev/null | grep -E '^[0-9]+$' | sort -n | tail -1 || true)
 
   echo "jenkins-local selftest:"
   check "build passed" '[ "$rc" = 0 ]'
   for stage in "Docker agent" "Workspace" "SCM checkout" "Secret from .env" "Agent label" "Credential types" \
-      "Artifact and test report"; do
+      "Shared library" "Artifact and test report"; do
     check "stage: $stage" 'stage_ok "$stage"'
   done
   check "artifact archived" '[ "$(cat "$build_dir/$n/archive/artifact.txt" 2>/dev/null)" = selftest-ok ]'
@@ -627,6 +724,7 @@ build() {
   fi
   cli get-job "$job" >/dev/null 2>&1 || index_branch "$project" "$job"
   ensure_labels "$repo/Jenkinsfile"
+  ensure_libraries "$repo/Jenkinsfile"
 
   warn_if_big
   echo "Building $project » $branch (working tree at ${commit:0:8}): http://127.0.0.1:$port/job/$project/job/$(branch_job_name "$branch")/" >&2
@@ -662,6 +760,7 @@ case "${1:-build}" in
   stop) docker rm -f "$name" >/dev/null 2>&1 || true; echo "stopped (data kept in $home)" ;;
   logs) docker logs -f "$name" ;;
   secret) shift; secret "$@" ;;
+  lib) shift; lib "$@" ;;
   -h|--help|help) sed -n '2,/^set -euo/p' "$0" | sed '$d; s/^# \{0,1\}//' ;;
   *) die "unknown command '$1' (see: jenkins-local help)" ;;
 esac
