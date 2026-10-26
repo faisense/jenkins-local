@@ -26,6 +26,8 @@ pipeline {
             steps {
                 checkout scm
                 sh '[ "$BRANCH_NAME" = "selftest/main" ] && [ -n "$GIT_COMMIT" ] && test -f marker.txt'
+                // selftest compares it with the snapshot it just made: no stale revision.
+                sh 'echo "selftest-commit=$GIT_COMMIT"'
             }
         }
 
