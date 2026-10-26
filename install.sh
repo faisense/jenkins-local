@@ -24,4 +24,4 @@ case ":$PATH:" in
   *":$bin:"*) ;;
   *) echo "Add $bin to PATH, e.g. in ~/.bashrc:  export PATH=\"\$HOME/.local/bin:\$PATH\"" ;;
 esac
-echo "Next: jenkins-local start   (then jenkins-local help)"
+echo "Next: jenkins-local selftest   (checks everything works; then jenkins-local help)"

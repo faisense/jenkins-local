@@ -12,6 +12,8 @@
 #                            keep the build's workspace afterwards (deleted by default)
 #   jenkins-local status     running or not, disk use, global secrets, jobs (and stale ones)
 #   jenkins-local prune      delete leftover workspaces (refuses while a build runs)
+#   jenkins-local selftest   build a small sample project and check each feature: docker
+#                            agent, workspace, .env secret, artifacts, test report, cleanup
 #   jenkins-local start      start Jenkins (http://127.0.0.1:8090)
 #   jenkins-local restart    rebuild the image and recreate the container; needed after editing
 #                            Dockerfile or plugins.txt
@@ -282,6 +284,62 @@ prune() {
   echo "Freed $(kb_to_human $((before - after))); $home is now $(kb_to_human "$after")."
 }
 
+# Build ../selftest/Jenkinsfile as a throwaway repo, then check from outside what the build
+# can't see itself. Leaves nothing behind but the pulled alpine image.
+selftest() {
+  # Not `name`: that is the container's, and bash locals are visible to called functions.
+  local sample=jenkins-local-selftest
+  local src=$home/selftest/$sample log=$home/selftest/build.log
+  local build_dir=$home/jobs/$sample/jobs/build/builds
+  local failures=0 rc=0 n
+
+  check() { if eval "$2"; then echo "  ok    $1"; else echo "  FAIL  $1"; failures=$((failures + 1)); fi; }
+  # Jenkins prints a step's error at the end of the log, not in its stage; but every stage
+  # after a failure says "skipped due to earlier failure(s)". So the failed stage is the last
+  # one that ran before the first skipped one, and a stage passed if it ran, wasn't skipped,
+  # and isn't that one.
+  stage_ok() {
+    local failed_stage
+    failed_stage=$(awk '
+      /^\[Pipeline\] \{ \(/ && !/Declarative/ { st = substr($0, 15); sub(/\)$/, "", st) }
+      /skipped due to earlier failure/ { print done; exit }
+      /^\[Pipeline\] \/\/ stage/ { done = st }' "$log" 2>/dev/null || true)
+    [ "$1" != "$failed_stage" ] || return 1
+    grep -qF "[Pipeline] { ($1)" "$log" && ! grep -qF "Stage \"$1\" skipped" "$log"
+  }
+
+  start
+  rm -rf "$src" && mkdir -p "$src"
+  cp "$(dirname "$conf")/selftest/Jenkinsfile" "$src/"
+  echo "copied into the workspace" > "$src/marker.txt"
+  echo "must not be copied" > "$src/ignored.txt"
+  printf 'ignored.txt\n.env\n' > "$src/.gitignore"
+  echo "SELFTEST_TOKEN=from-dotenv" > "$src/.env"
+  git -C "$src" init -q
+
+  echo "Building the sample project (first run pulls alpine:3.20)..." >&2
+  (cd "$src" && build) > "$log" 2>&1 || rc=$?
+  n=$(ls "$build_dir" 2>/dev/null | grep -E '^[0-9]+$' | sort -n | tail -1 || true)
+
+  echo "jenkins-local selftest:"
+  check "build passed" '[ "$rc" = 0 ]'
+  for stage in "Docker agent" "Workspace" "Secret from .env" "Artifact and test report"; do
+    check "stage: $stage" 'stage_ok "$stage"'
+  done
+  check "artifact archived" '[ "$(cat "$build_dir/$n/archive/artifact.txt" 2>/dev/null)" = selftest-ok ]'
+  check "test report recorded" '[ -f "$build_dir/$n/junitResult.xml" ]'
+  check "workspace deleted after the build" '[ ! -e "$home/workspace/$sample/build" ]'
+
+  if [ "$failures" = 0 ]; then
+    cli delete-job "$sample" >/dev/null 2>&1 || true
+    rm -rf "$home/selftest" "$home/workspace/$sample"
+    echo "All good."
+  else
+    echo "$failures check(s) failed. Build log: $log (job kept: http://127.0.0.1:$port/job/$sample/)"
+    return 1
+  fi
+}
+
 build() {
   local env_file="" use_env=1 keep_ws=0
   while [ $# -gt 0 ]; do
@@ -370,6 +428,7 @@ case "${1:-build}" in
   start) start ;;
   status) status ;;
   prune) prune ;;
+  selftest) selftest ;;
   restart) docker rm -f "$name" >/dev/null 2>&1 || true; start ;;
   stop) docker rm -f "$name" >/dev/null 2>&1 || true; echo "stopped (data kept in $home)" ;;
   logs) docker logs -f "$name" ;;

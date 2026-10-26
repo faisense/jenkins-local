@@ -5,6 +5,7 @@ builds on demand from your working tree; it is not a CI server.
 
 ```bash
 ./install.sh                 # once per machine: links bin/jenkins-local into ~/.local/bin
+jenkins-local selftest       # check this machine: builds a sample project, ok/FAIL per feature
 cd ~/path/to/some-repo       # any git repo with a Jenkinsfile
 jenkins-local                # build it, stream the log, exit with the build's result
 ```
@@ -39,6 +40,7 @@ Pipeline plugin, so `agent { docker { image '...' } }` works.
 | `jenkins-local` | build the current repo (`-e FILE`, `--no-env`, `--keep-workspace`) |
 | `jenkins-local status` | running or not, disk use, secrets, jobs (flags jobs whose repo is gone) |
 | `jenkins-local prune` | delete leftover workspaces |
+| `jenkins-local selftest` | build `selftest/Jenkinsfile` as a throwaway repo and check each feature (docker agent, workspace, `.env` secret, artifacts, test report, cleanup); leaves nothing behind when all pass |
 | `jenkins-local start` / `stop` / `restart` / `logs` | the Jenkins container; `restart` after editing `config/` |
 | `jenkins-local secret set\|list\|rm` | global secrets |
 
@@ -57,6 +59,7 @@ build warns when the data passes `JENKINS_LOCAL_WARN_GB` (default 5). Data lives
 | `bin/jenkins-local` | the command |
 | `config/Dockerfile`, `config/plugins.txt` | the Jenkins image |
 | `config/job.xml` | template of each repo's job |
+| `selftest/Jenkinsfile` | the sample project `selftest` builds |
 | `~/.config/jenkins-local/secrets/` | global secrets (per machine, not in git) |
 | `~/.local/share/jenkins-local/` | `JENKINS_HOME`: jobs, builds, workspaces (per machine) |
 
