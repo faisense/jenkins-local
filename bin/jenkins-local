@@ -441,7 +441,7 @@ status() {
   usage_breakdown
   echo "Global secrets: $(ls "$secrets" 2>/dev/null | wc -l)"
   if running; then
-    echo "Agent labels: $(echo 'print(jenkins.model.Jenkins.get().labelString ?: "")' | cli groovy = 2>/dev/null || true)"
+    echo "Agent labels: $(echo 'println(jenkins.model.Jenkins.get().labelString ?: "")' | cli groovy = 2>/dev/null || true)"
   fi
   echo "Jobs:"
   local cfg repo
